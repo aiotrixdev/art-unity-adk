@@ -1,3 +1,61 @@
 # Default ignored files
 /shelf/
 /workspace.xml
+# ========== Unity Generated Folders ==========
+/Library/
+/Temp/
+/Obj/
+/Build/
+/Builds/
+/Logs/
+/UserSettings/
+
+# ========== Visual Studio / IDE ==========
+.vs/
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+
+# ========== Rider / JetBrains ==========
+.idea/
+*.sln.iml
+
+# ========== OS Files ==========
+.DS_Store
+Thumbs.db
+
+# ========== Unity Cache ==========
+/MemoryCaptures/
+/Recordings/
+
+# ========== Addressables ==========
+/ServerData/
+
+# ========== Gradle / Android ==========
+.gradle/
+local.properties
+*.apk
+*.aab
+
+# ========== iOS ==========
+*.xcworkspace
+*.xcuserdata
+*.xcodeproj/project.xcworkspace/
+
+# ========== Logs ==========
+*.log
+
+# ========== Temp Files ==========
+*.tmp
+*.temp
+
+# ========== Keep important ==========
+!/[Aa]ssets/
+/[Pp]rojectSettings/
+/[Pp]ackages/
