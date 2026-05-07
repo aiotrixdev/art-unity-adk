@@ -9,7 +9,7 @@
 /Builds/
 /Logs/
 /UserSettings/
-
+/Tests/
 # ========== Visual Studio / IDE ==========
 .vs/
 *.csproj
