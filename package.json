@@ -1,0 +1,22 @@
+{
+  "name": "com.arealtimetech.adk",
+  "version": "1.0.0",
+  "displayName": "ART ADK",
+  "description": "ART (ArealtimeTech) ADK - Real-time WebSocket communication toolkit for Unity",
+  "unity": "2022.3",
+  "dependencies": {
+    "com.unity.nuget.newtonsoft-json": "3.2.1"
+  },
+  "keywords": [
+    "realtime",
+    "websocket",
+    "adk",
+    "art",
+    "crdt"
+  ],
+  "author": {
+    "name": "ArealtimeTech",
+    "url": "https://arealtimetech.com"
+  },
+  "license": "MIT"
+}
