@@ -74,7 +74,6 @@ public class MyGame : MonoBehaviour
         // 4. Listen for messages
         sub.Listen(msg =>
         {
-            Debug.Log($"Event: {msg["event"]}, Content: {msg["content"]}");
         });
 
         // 5. Push a message
@@ -126,7 +125,6 @@ await sub.Push("message", data, new PushOptions("target-user"));
 var presence = new PresenceManager(subscription);
 presence.StartTracking(unique: true, onPresenceChanged: users =>
 {
-    Debug.Log($"Online: {string.Join(", ", users)}");
 });
 ```
 

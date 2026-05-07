@@ -136,7 +136,6 @@ namespace ART.ADK
             }
             catch (Exception ex)
             {
-                Debug.Log($"[ART] Authentication failed: {ex.Message}");
                 _isConnecting = false;
                 _emitter.Emit("close", ex);
                 throw;
@@ -148,8 +147,6 @@ namespace ART.ADK
                 $"&token={Uri.EscapeDataString(authData.AccessToken)}" +
                 $"&environment={Uri.EscapeDataString(_credentials.Environment)}" +
                 $"&project-key={Uri.EscapeDataString(_credentials.ProjectKey)}";
-
-            Debug.Log($"[ART] Connecting to: {wsUrl}");
 
             // Close existing connection
             await SafeClose();
@@ -223,7 +220,6 @@ namespace ART.ADK
                 ProjectKey = _credentials.ProjectKey
             };
 
-            Debug.Log($"[ART] Live connection opened {_connection.ConnectionId}");
             _emitter.Emit("connection", _connection);
             IsConnectionActive = true;
             StartHeartbeat();
@@ -259,8 +255,6 @@ namespace ART.ADK
             var fromName = connId;
             try { fromName = Auth.GetInstance().Username ?? fromId; } catch { }
 
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] PushForSecureLine: fromId={fromId}, fromName={fromName}");
-
             var payload = new JObject
             {
                 ["from"] = fromId,
@@ -282,10 +276,8 @@ namespace ART.ADK
 
             var tcs = new TaskCompletionSource<object>();
             SecureCallbacks[$"secure-{refId}"] = result => {
-                UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] PushForSecureLine response: {JsonConvert.SerializeObject(result)}");
                 tcs.TrySetResult(result);
             };
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] Sending PushForSecureLine: {msgStr}");
             SendMessage(msgStr);
 
             // Timeout after 30s
@@ -334,9 +326,7 @@ namespace ART.ADK
             else
             {
                 subscription = new Subscription(connectionId, channelConfig, this, "subscribe");
-                Debug.Log($"Subscription data....else...'{subscription}'");
             } 
-            Debug.Log($"Subscription data....out..'{subscription}'");
 
             _subscriptions[channel] = subscription;
 
@@ -417,11 +407,9 @@ namespace ART.ADK
 
         private void HandleIncomingMessage(JObject parsed)
         {
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] Incoming Raw Message: {parsed.ToString(Formatting.None)}");
             var channel = parsed["channel"]?.ToString();
             if (string.IsNullOrEmpty(channel) && parsed["event"] == null)
             {
-                Debug.Log($"[ART] Message missing channel: {parsed}");
                 return;
             }
 
@@ -481,7 +469,6 @@ namespace ART.ADK
 
             if (string.IsNullOrEmpty(channel) || (string.IsNullOrEmpty(evt) && returnFlag != "SA"))
             {
-                Debug.Log($"[ART] Message without channel or event: {parsed}");
                 return;
             }
 
@@ -499,7 +486,6 @@ namespace ART.ADK
             // Interceptor routing
             if (!string.IsNullOrEmpty(interceptorName))
             {
-                Debug.Log($"[ART-Socket] Message received for interceptor: '{interceptorName}' on channel: '{channel}'");
                 if (_interceptors.TryGetValue(interceptorName, out var interception))
                 {
                     _ = Task.Run(async () =>
@@ -510,7 +496,6 @@ namespace ART.ADK
                 }
                 else
                 {
-                    Debug.LogWarning($"[ART-Socket] Received message for interceptor '{interceptorName}', but no such interceptor is registered locally!");
                 }
                 return;
             }
@@ -530,7 +515,6 @@ namespace ART.ADK
             }
             else
             {
-                Debug.Log($"[ART] No subscription for {subKey} - buffering");
                 if (!_pendingIncomingMessages.ContainsKey(subKey))
                     _pendingIncomingMessages[subKey] = new List<(string, JObject)>();
                 _pendingIncomingMessages[subKey].Add((evt, payload));
@@ -540,7 +524,6 @@ namespace ART.ADK
         private void SwitchToHttpPoll()
         {
             if (_pullSource == "http") return;
-            Debug.Log("[ART] Shifting to HTTP poll");
             _pullSource = "http";
             _pushSource = "http";
             _lpClient.Start(_connection?.ConnectionId ?? "");
@@ -549,23 +532,18 @@ namespace ART.ADK
         // ---- IWebSocketHandler: SendMessage ----
         public bool SendMessage(string message)
         {
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] Outgoing Raw Message: {message}");
             if (_ws == null || _ws.State != WebSocketState.Open)
             {
                 PendingSendMessages.Add(message);
-                Debug.Log("[ART] WebSocket not open - message buffered");
                 return false;
             } 
-             Debug.Log("[ART] WebSocket not open - message buffered send message....");
 
             var bytes = Encoding.UTF8.GetBytes(message);
-            Debug.Log($"[ART] WebSocket not open - message buffered send message....{bytes}");
 
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    Debug.Log("[ART] WebSocket not open - message buffered send message....inside....{bytes}");
 
                     await _ws.SendAsync(new ArraySegment<byte>(bytes),
                         WebSocketMessageType.Text, true, _wsCts?.Token ?? CancellationToken.None);

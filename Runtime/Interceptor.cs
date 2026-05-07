@@ -30,22 +30,18 @@ namespace ART.ADK
 
         public async Task ValidateInterception()
         {
-            Debug.Log($"[ART-Interceptor] Validating interception for: {_interceptorName}");
             try 
             {
                 _interceptorData = await HelperFunctions.GetInterceptorConfig(_interceptorName, _websocketHandler);
-                Debug.Log($"[ART-Interceptor] Successfully received config for {_interceptorName}: {_interceptorData}");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[ART-Interceptor] Failed to validate interception for {_interceptorName}: {ex.Message}");
                 throw;
             }
         }
 
         public void Reconnect()
         {
-            Debug.Log($"[ART] reconnecting interceptor {_interceptorName}");
             _ = Task.Run(async () =>
             {
                 try { await ValidateInterception(); }
@@ -86,7 +82,6 @@ namespace ART.ADK
 
         private void Execute(JObject request)
         {
-            Debug.Log($"[ART-Interceptor] Executing callback for interceptor: {_interceptorName}");
             AcknowledgeInterceptor(request);
 
             var id = request["id"]?.ToString() ?? "";
@@ -132,7 +127,6 @@ namespace ART.ADK
 
             Action<string> reject = error =>
             {
-                Debug.Log($"[ART-Interceptor] Interceptor {_interceptorName} REJECTED message. Error: {error}");
                 var errResponse = new JObject
                 {
                     ["rawData"] = request["data"],
@@ -143,7 +137,6 @@ namespace ART.ADK
                 SendJson(response);
             };
 
-            Debug.Log($"[ART-Interceptor] Invoking user function for {_interceptorName}...");
             _fn(request, resolve, reject);
         }
 
@@ -168,13 +161,11 @@ namespace ART.ADK
                 catch { response["content"] = ""; }
             }
 
-            Debug.Log($"[ART-Interceptor] Sending Acknowledgment (IA) for {_interceptorName}");
             SendJson(response);
         }
 
         public async Task HandleMessage(string channel, JObject data)
         {
-            Debug.Log($"[ART-Interceptor] Received message for interception on channel '{channel}' via interceptor '{_interceptorName}'");
             var mutable = new JObject(data);
             var dataStr = data["data"]?.ToString();
             if (dataStr != null)

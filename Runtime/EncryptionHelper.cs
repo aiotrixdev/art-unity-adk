@@ -69,13 +69,9 @@ namespace ART.ADK
 
             byte[] msgBytes = Encoding.UTF8.GetBytes(message);
 
-            Debug.Log($"[ENCRYPT] Plaintext ({msgBytes.Length} bytes): {message}");
-            Debug.Log($"[ENCRYPT] RecipientPublicKey: {recipientPublicKey}");
-
             // Random 24-byte nonce
             var nonce = new byte[NonceLength];
             using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(nonce);
-            Debug.Log($"[ENCRYPT] Nonce (base64): {Convert.ToBase64String(nonce)}");
 
             // NaCl box: tag(16) + ciphertext
             byte[] boxed = NaclBox.Box(msgBytes, nonce, pub, priv);
@@ -86,7 +82,6 @@ namespace ART.ADK
             Array.Copy(boxed,  0, full, NonceLength, boxed.Length);
 
             var result = Convert.ToBase64String(full);
-            Debug.Log($"[ENCRYPT] Ciphertext ({full.Length} bytes total, base64 len={result.Length}): {result.Substring(0, Mathf.Min(60, result.Length))}...");
             return result;
         }
 
@@ -110,16 +105,11 @@ namespace ART.ADK
             if (full.Length < NonceLength + NaclBox.OverheadBytes)
                 throw new EncryptionHelperException(EncryptionError.DataTooShort);
 
-            Debug.Log($"[DECRYPT] Ciphertext total size: {full.Length} bytes");
-            Debug.Log($"[DECRYPT] SenderPublicKey: {senderPublicKey}");
-
             // Split nonce and box
             var nonce = new byte[NonceLength];
             var box   = new byte[full.Length - NonceLength];
             Array.Copy(full, 0,          nonce, 0, NonceLength);
             Array.Copy(full, NonceLength, box,  0, box.Length);
-            Debug.Log($"[DECRYPT] Nonce (base64): {Convert.ToBase64String(nonce)}");
-            Debug.Log($"[DECRYPT] Box (tag+cipher) size: {box.Length} bytes");
 
             // NaclBox.Open throws AuthenticationFailed on tag mismatch
             byte[] plainBytes = NaclBox.Open(box, nonce, pub, priv);
@@ -127,7 +117,6 @@ namespace ART.ADK
             try
             {
                 var plaintext = Encoding.UTF8.GetString(plainBytes);
-                Debug.Log($"[DECRYPT] ✅ Decrypted plaintext ({plainBytes.Length} bytes): {plaintext}");
                 return plaintext;
             }
             catch { throw new EncryptionHelperException(EncryptionError.Utf8DecodeFailed); }

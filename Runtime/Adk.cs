@@ -191,7 +191,6 @@ namespace ART.ADK
                 if (_reconnectAttempts < _maxReconnectAttempts)
                 {
                     _reconnectAttempts++;
-                    Debug.Log($"[ART] Reconnecting in {_reconnectDelay / 1000}s (attempt {_reconnectAttempts})");
                     await Task.Delay((int)_reconnectDelay, ct);
                     if (ct.IsCancellationRequested) return;
                     await Connect();
@@ -199,7 +198,6 @@ namespace ART.ADK
                 }
                 else
                 {
-                    Debug.Log($"[ART] Max reconnect attempts reached. Retrying in {_maxDelay / 1000}s");
                     await Task.Delay((int)_maxDelay, ct);
                     if (ct.IsCancellationRequested) return;
                     await Connect();
@@ -263,9 +261,6 @@ namespace ART.ADK
         /// <summary>Set an existing key pair and save it to the server.</summary>
         public async Task SetKeyPair(KeyPairType keyPair)
         { 
-            Debug.Log($"Generated key value pair...public key...'{keyPair.PublicKey}'");
-            Debug.Log($"Generated key value pair...private key...'{keyPair.PrivateKey}'");
-
             if (string.IsNullOrEmpty(keyPair.PublicKey) || string.IsNullOrEmpty(keyPair.PrivateKey))
                 throw new ARTEncryptionException("Invalid KeyPair: keys must be non-empty strings");
             await SavePublicKey(keyPair);
@@ -293,8 +288,6 @@ namespace ART.ADK
 
             var op = request.SendWebRequest();
             while (!op.isDone) await Task.Yield();
-
-            Debug.Log($"[ART] UpdatePublicKey Response ({request.responseCode}): {request.downloadHandler.text}");
 
             if (request.responseCode != 200)
                 throw new ARTServerException($"Error updating keypair: {request.downloadHandler.text}");

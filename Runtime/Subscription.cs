@@ -105,8 +105,6 @@ namespace ART.ADK
             {
                 //try
                 //{
-                Debug.Log($"PAYLOAD json '{payload}'");
-                    Debug.Log($"PAYLOAD '{payload["from_username"]}'");
                     var secureResult = await WebSocketHandler.PushForSecureLine(
                         "secured_public_key",
                         new Dictionary<string, object>
@@ -114,23 +112,17 @@ namespace ART.ADK
                             { "username", !string.IsNullOrEmpty(payload["from_username"]?.ToString()) ? payload["from_username"].ToString() : payload["from"]?.ToString() ?? "" }
                         },
                         true) as JObject;
-                    Debug.Log($"[ART] Decryption result....: {secureResult}");
 
                     var innerData = secureResult?["data"] as JObject;
                     var pubKey = innerData?["public_key"]?.ToString();
                     if (pubKey == null) return;
                     if (innerData?["status"]?.ToString() == "unsuccessfull") return;
-                     Debug.Log($"[ART] Decryption result....inner data: {innerData}");
-                     Debug.Log($"[ART] Decryption result....public key: {pubKey}");
 
                     var encryptedData = mutablePayload["data"]?.ToString();
-                     Debug.Log($"[ART] Decryption result....encrypted key: {encryptedData}");
                     if (encryptedData != null)
                     {
-                        Debug.Log($"[ART] Decryption result....encrypted key inside : {pubKey}");
                         var decrypted = await WebSocketHandler.Decrypt(encryptedData, pubKey);
                         mutablePayload["data"] = decrypted;
-                        Debug.Log($"[ART] Decryption result....decrypt inside encrypted : {decrypted}");
 
                     }
 

@@ -61,7 +61,6 @@ namespace ART.ADK
             }
             catch (Exception ex)
             {
-                Debug.Log($"[ART] validateSubscription error: {ex.Message}");
             }
         }
 
@@ -173,11 +172,9 @@ namespace ART.ADK
                 var config = await HelperFunctions.SubscribeToChannel(
                     ChannelConfig.ChannelName, "subscribe", WebSocketHandler);
                 ChannelConfig = config;
-                Debug.Log($"subscribed,.....");
             }
             catch (Exception ex)
             {
-                Debug.Log($"[ART] subscribe error: {ex.Message}");
                 IsSubscribed = false;
             }
         }
@@ -200,7 +197,6 @@ namespace ART.ADK
             }
             catch (Exception ex)
             {
-                Debug.Log($"[ART] unsubscribe error: {ex.Message}");
             }
         }
 
@@ -272,8 +268,6 @@ namespace ART.ADK
             var channelFull = chName;
             if (!string.IsNullOrEmpty(ChannelConfig.ChannelNamespace))
                 channelFull += $":{ChannelConfig.ChannelNamespace}";
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] from user name: {connection.ConnectionId}");
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] from user name option: {options?.FromUsername}");
 
             var message = new JObject
             {
@@ -286,8 +280,6 @@ namespace ART.ADK
 
             if (refId != null)
                 message["ref_id"] = refId;
-UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] from id: {fromId}");
-            UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] Sending Message Payload: {message.ToString(Formatting.None)}");
             WebSocketHandler.SendMessage(message.ToString(Formatting.None));
         }
 
@@ -322,7 +314,6 @@ UnityEngine.Debug.Log($"[ART-DIAGNOSTIC] from id: {fromId}");
         // ---- HandleMessage (virtual, overridden by Subscription/SharedObjectChannel) ----
         public virtual Task HandleMessage(string evt, JObject payload)
         { 
-            Debug.Log($"handle message......'{payload}'");
             return Task.CompletedTask;
         }
     }

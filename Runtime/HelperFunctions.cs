@@ -83,17 +83,13 @@ namespace ART.ADK
         public static async Task<object> GetInterceptorConfig(
             string interceptor, IWebSocketHandler handler)
         {
-            Debug.Log($"[ART-Helper] Fetching interceptor config for: {interceptor}");
             await handler.Wait();
 
             var result = await handler.PushForSecureLine("interceptor-subscribe",
                 new Dictionary<string, object> { { "interceptor", interceptor } }, true);
 
-            Debug.Log($"[ART-Helper] interceptor-subscribe response: {result ?? "NULL"}");
-
             if (result == null) 
             {
-                Debug.LogWarning($"[ART-Helper] Timeout or null response for interceptor: {interceptor}");
                 return null;
             }
 
@@ -101,19 +97,16 @@ namespace ART.ADK
             var data = wrapper["data"] as JObject;
             if (data == null) 
             {
-                Debug.LogError($"[ART-Helper] Response missing 'data' field: {wrapper}");
                 return null;
             }
 
             if (data["status"]?.ToString() == "not-OK")
             {
                 var errMsg = data["error"]?.ToString() ?? "Unknown error";
-                Debug.LogError($"[ART-Helper] Server rejected interceptor '{interceptor}': {errMsg}");
                 throw new ARTServerException(errMsg);
             }
 
             var config = data["interceptorConfig"];
-            Debug.Log($"[ART-Helper] Successfully parsed config for {interceptor}: {config}");
             return config;
         }
     }
