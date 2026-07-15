@@ -42,6 +42,7 @@ namespace ART.ADK
         /// <summary>Fired on connection error.</summary>
         public event Action<object> OnError;
 
+        private CredentialStore credentialData;
         /// <summary>
         /// Create a new Adk instance.
         /// </summary>
@@ -76,6 +77,7 @@ namespace ART.ADK
             SocketInstance.On("close", _ => HandleOnClose());
             SocketInstance.On("error", err => OnError?.Invoke(err));
         }
+
 
         // ---- Connect ----
         /// <summary>Connect to the ART real-time infrastructure.</summary>
@@ -208,28 +210,19 @@ namespace ART.ADK
         // ---- Socket Connection ----
         private async Task InitiateSocketConnection()
         {
-            AuthenticationConfig authConfig;
+            // Credentials can come from the AdkConfig.GetCredentials callback (used by the
+            // example app) or be set explicitly via SetCredentials().
+            CredentialStore authConfig = _adkConfig?.GetCredentials != null
+                ? _adkConfig.GetCredentials()
+                : credentialData;
 
-            if (_adkConfig?.GetCredentials != null)
+            if (authConfig == null)
             {
-                var store = _adkConfig.GetCredentials();
-                authConfig = new AuthenticationConfig
-                {
-                    Environment = store.Environment,
-                    ProjectKey = store.ProjectKey,
-                    OrgTitle = store.OrgTitle,
-                    ClientID = store.ClientID,
-                    ClientSecret = store.ClientSecret,
-                    AccessToken = store.AccessToken
-                };
-            }
-            else
-            {
-                authConfig = new AuthenticationConfig();
+                Debug.LogError("Configuration not loaded");
+                return;
             }
 
             authConfig.Config = _adkConfig;
-            authConfig.GetCredentials = _adkConfig?.GetCredentials;
             await SocketInstance.InitiateSocket(authConfig);
         }
 
@@ -295,6 +288,36 @@ namespace ART.ADK
             MyKeyPair = keyPair;
         }
 
+        
+    public Agent Agent(string agentId) {
+        return new Agent(agentId, SocketInstance);
+    }
+
+
+    public Orchestrator Orchestrator(string orchId) {
+        return new Orchestrator(orchId, SocketInstance);
+    }
+
+
+  public void SetCredentials(CredentialStore config)
+{
+    credentialData = config;
+}
+     
+
+     public async Task<CredentialStore> LoadConfig()
+        {
+            using var request = UnityWebRequest.Get(ArtConstants.CONFIG_JSON_PATH);
+
+            var op = request.SendWebRequest();
+            while (!op.isDone) await Task.Yield();
+
+            if (request.result != UnityWebRequest.Result.Success)
+                throw new ARTServerException(
+                    $"Loading config from {ArtConstants.CONFIG_JSON_PATH} failed: {request.error}");
+
+            return JsonConvert.DeserializeObject<CredentialStore>(request.downloadHandler.text);
+        }
         // ---- REST API Call ----
         /// <summary>
         /// Make an authenticated REST API call to the ART backend.
