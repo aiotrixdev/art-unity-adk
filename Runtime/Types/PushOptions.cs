@@ -13,6 +13,13 @@ namespace ART.ADK
         /// <summary>Username of the sender.</summary>
         public string FromUsername { get; set; } = "";
 
+        /// <summary>
+        /// Orchestrator thread this push belongs to. Serialized as a top-level
+        /// <c>thread_id</c> field on the wire frame (mirrors the Kotlin
+        /// <c>PushConfig.threadId</c>), NOT inside the content payload.
+        /// </summary>
+        public string ThreadId { get; set; }
+
         public PushOptions() { }
 
         public PushOptions(params string[] to)
@@ -39,7 +46,7 @@ namespace ART.ADK
     {
         public string Uri { get; set; } = "";
         public string AuthToken { get; set; }
-
+        public bool AutoLoadCredsFromJSON;
         /// <summary>
         /// Optional callback to provide credentials dynamically.
         /// </summary>
@@ -57,6 +64,7 @@ namespace ART.ADK
         public string ClientID { get; set; } = "";
         public string ClientSecret { get; set; } = "";
         public string AccessToken { get; set; }
+        public AdkConfig Config { get; set; }
     }
 
     /// <summary>
@@ -106,4 +114,23 @@ namespace ART.ADK
             PrivateKey = privateKey;
         }
     }
+
+public class PushConfig
+{
+    public string ThreadID { get; set; }
+    public string EventName { get; set; }
+    public int? TimeoutMs { get; set; }
+    // Add any other fields from your TypeScript PushConfig type here
+public List<string> To { get; set; } = new List<string>();    public PushConfig() { }
+
+    // Copy constructor used in OrchestratorThread.Push()
+    public PushConfig(PushConfig source)
+    {
+        if (source == null) return;
+        ThreadID = source.ThreadID;
+        EventName = source.EventName;
+        TimeoutMs = source.TimeoutMs;
+        To = source.To != null ? new List<string>(source.To) : new List<string>();
+    }
+}
 }

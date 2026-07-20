@@ -78,5 +78,6 @@ namespace ART.ADK
         public List<string> PresenceUsers { get; set; } = new List<string>();
         public object Snapshot { get; set; }
         public string SubscriptionID { get; set; }
+        public bool OrchestratorEnabled { get; set; }
     }
 }
