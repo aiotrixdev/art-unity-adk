@@ -41,9 +41,10 @@ namespace ART.ADK
         }
 
         /// <summary>
-        /// Returns a new <see cref="AgentThread"/> backed by this agent. Each call returns a
-        /// fresh thread with its own thread id; the same agent may host many concurrent threads.
+        /// Returns a new <see cref="AgentThread"/> backed by this agent. When
+        /// <paramref name="threadId"/> is omitted, <see cref="AgentThread"/> generates one.
+        /// The same agent may host many concurrent threads.
         /// </summary>
-        public AgentThread Thread() => new AgentThread(this);
+        public AgentThread Thread(string threadId = null) => new AgentThread(this, threadId);
     }
 }

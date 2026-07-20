@@ -34,21 +34,23 @@ namespace ART.ADK
     /// <c>FeedbackRequest</c> handlers. At most one <see cref="Run"/> is active at a time.
     /// Mirrors <c>js-adk-common/agentic/agentThread.ts</c>.
     /// </summary>
- public class AgentThread
-{
+    public class AgentThread
+    {
     public Agent Agent { get; }
     public string ThreadId { get; }
 
-    private bool _masterListenerInstalled = false;
+    private readonly object _masterListenerLock = new object();
     private Task _masterListenerTask;
-   private readonly List<Action<AgentEventEnvelope>> _userListeners = new List<Action<AgentEventEnvelope>>();
+    private readonly List<Action<AgentEventEnvelope>> _userListeners = new List<Action<AgentEventEnvelope>>();
     private readonly List<Func<HumanInputRequest, Run, Task>> _humanInputHandlers = new List<Func<HumanInputRequest, Run, Task>>();
     private Run _activeRun = null;
 
-    public AgentThread(Agent agent)
+    public AgentThread(Agent agent, string threadId = null)
     {
         Agent = agent;
-        ThreadId = GenerateThreadId();
+        ThreadId = string.IsNullOrWhiteSpace(threadId)
+        ? GenerateThreadId()
+        : threadId;
     }
 
     private string GenerateThreadId()
@@ -61,23 +63,54 @@ namespace ART.ADK
     /// user Listen callbacks and the active Run. Idempotent — first caller
     /// wins; subsequent calls return the same task.
     /// </summary>
-    private Task EnsureMasterListener()
+    private async Task EnsureMasterListener()
     {
-        if (_masterListenerTask != null) return _masterListenerTask;
-        _masterListenerTask = Task.Run(async () =>
+        Task listenerTask;
+        lock (_masterListenerLock)
         {
-            var sub = await Agent.GetSubscription();
-            sub.Listen((raw) => Dispatch(raw));
-            _masterListenerInstalled = true;
-        });
-        return _masterListenerTask;
+            if (_masterListenerTask == null)
+                _masterListenerTask = InstallMasterListener();
+            listenerTask = _masterListenerTask;
+        }
+
+        try
+        {
+            await listenerTask;
+        }
+        catch
+        {
+            // A failed subscription must not poison this thread permanently: later
+            // Listen/Run calls should be able to retry, as in the Kotlin SDK.
+            lock (_masterListenerLock)
+            {
+                if (_masterListenerTask == listenerTask)
+                    _masterListenerTask = null;
+            }
+            throw;
+        }
+    }
+
+    private async Task InstallMasterListener()
+    {
+        var sub = await Agent.GetSubscription();
+        sub.Listen(raw => Dispatch(raw));
+        sub.AttachThreadListener(ThreadId, Dispatch);
     }
 
   private void Dispatch(object raw)
 {
     AgentEventEnvelope envelope;
+     
 
-    if (raw is JObject jRaw)
+    if (raw is ThreadEventEnvelope threadEnvelope)
+    {
+        envelope = AgentEventEnvelope.Parse(new JObject
+        {
+            ["event"] = threadEnvelope.Event,
+            ["content"] = threadEnvelope.Content ?? new JObject()
+        });
+    }
+    else if (raw is JObject jRaw)
     {
         envelope = AgentEventEnvelope.Parse(jRaw);
     }
@@ -95,10 +128,13 @@ namespace ART.ADK
         });
     }
 
+    
     // Surface wire-level transport errors as typed agent_error
     if (envelope.Event == "error" || envelope.Event == "transport_error")
     {
-        var c = envelope.Content as JObject ?? new JObject();
+        var c = (envelope.Content as UnknownAgentEvent)?.Content
+                ?? envelope.Content as JObject
+                ?? new JObject();
         string message = c["message"]?.ToString()
                       ?? c["error"]?.ToString()
                       ?? "WebSocket error";
@@ -118,6 +154,8 @@ namespace ART.ADK
         });
     }
 
+    LogInboundEvent(envelope);
+
     if (!AgentEvents.IsKnownAgentEvent(envelope.Event))
     {
         Debug.LogWarning($"[adk] unknown agent event \"{envelope.Event}\" — passing through untyped.");
@@ -135,6 +173,34 @@ namespace ART.ADK
         catch (Exception e) { Debug.LogError($"[adk] user listen callback threw: {e}"); }
     }
 }
+
+    private void LogInboundEvent(AgentEventEnvelope envelope)
+    {
+        Debug.Log($"[adk] agent envelop ${envelope}");
+
+        switch (envelope.Content)
+        {
+            case AgentOutput output:
+                Debug.Log(
+                    $"[adk] agent response received (thread={ThreadId}, ref_id={output.RefId})\n" +
+                    $"{output.Message}\n" +
+                    output.ToJson().ToString());
+                break;
+            case AgentError error:
+                Debug.LogError(
+                    $"[adk] agent error received (thread={ThreadId}, ref_id={error.RefId})\n" +
+                    $"{error.Code}: {error.Message}\n" +
+                    JObject.FromObject(error).ToString());
+                break;
+            case UnknownAgentEvent unknown:
+                Debug.Log($"[adk] agent event unknown'{envelope.Event}' (thread={ThreadId})\n{unknown.Content}");
+                break;
+            default:
+                Debug.Log($"[adk] agent event default'{envelope.Event}' (thread={ThreadId})\n" +
+                          JObject.FromObject(envelope.Content ?? new object()));
+                break;
+        }
+    }
     /// <summary>
     /// Subscribe to typed events from this agent's channel.
     /// Multiple Listen callbacks may be registered; each receives every event.
@@ -148,8 +214,19 @@ namespace ART.ADK
     /// Register a handler invoked whenever a HumanInputRequest arrives for
     /// an active run. Call run.RespondToHumanInput(value) to continue the loop.
     /// </summary>
+    public void FeedbackRequest(AgentHumanInputHandler handler)
+    {
+        if (handler == null) throw new ArgumentNullException(nameof(handler));
+        _humanInputHandlers.Add(handler.Invoke);
+    }
+
+    /// <summary>
+    /// Unity-compatible alias for <see cref="FeedbackRequest"/>, which mirrors Kotlin's
+    /// <c>feedbackRequest</c> API.
+    /// </summary>
     public void OnHumanInput(Func<HumanInputRequest, Run, Task> handler)
     {
+        if (handler == null) throw new ArgumentNullException(nameof(handler));
         _humanInputHandlers.Add(handler);
     }
 
@@ -179,6 +256,9 @@ namespace ART.ADK
         }
     }
 
+    /// <summary>Kotlin-compatible name for <see cref="FireHumanInput"/>.</summary>
+    public void FireRequestFeedback(HumanInputRequest req, Run run) => FireHumanInput(req, run);
+
     /// <summary>
     /// Internal — clear active run on terminal event.
     /// </summary>
@@ -190,7 +270,7 @@ namespace ART.ADK
     /// <summary>
     /// Internal — send a user_reply carrying reply_id.
     /// </summary>
-   public async Task<string> SendReply(object value, string replyId)
+    public async Task<string> SendReply(object value, string replyId)
 {
     var sub = await Agent.GetSubscription();
     var content = new JObject
@@ -199,15 +279,15 @@ namespace ART.ADK
         ["thread_id"] = ThreadId,
         ["reply_id"] = replyId
     };
-    await sub.Push("user_reply", content);
-    return "";
+    var ack = await sub.Push("user_reply", content);
+    return ack?["ref_id"]?.ToString() ?? "";
 }
 
     /// <summary>
     /// Start a new run on this thread. Returns a Run handle whose Done()
     /// task resolves with the terminal AgentOutput or throws an AgentError.
     /// </summary>
-public async Task<Run> Run(object userInput, string replyId = null)
+    public async Task<Run> Run(object userInput, RunDeps deps = null)
 {
     await EnsureMasterListener();
 
@@ -221,6 +301,7 @@ public async Task<Run> Run(object userInput, string replyId = null)
     _activeRun = run;
 
     var sub = await Agent.GetSubscription();
+    var replyId = deps?.ReplyId;
     string eventName = replyId != null ? "user_reply" : "user_input";
     var content = new JObject
     {
@@ -229,10 +310,17 @@ public async Task<Run> Run(object userInput, string replyId = null)
     };
     if (replyId != null) content["reply_id"] = replyId;
 
-    await sub.Push(eventName, content);
-    run.SetRefId("");
+    var ack = await sub.Push(eventName, content);
+    run.SetRefId(ack?["ref_id"]?.ToString() ?? "");
     return run;
 }
+
+    /// <summary>
+    /// Convenience overload retained for callers that supplied a reply id directly.
+    /// Prefer <see cref="Run(object, RunDeps)"/> to match the Kotlin API.
+    /// </summary>
+    public Task<Run> Run(object userInput, string replyId)
+        => Run(userInput, replyId == null ? null : new RunDeps { ReplyId = replyId });
 }
 }
 
