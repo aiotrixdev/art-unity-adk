@@ -18,8 +18,16 @@ namespace ART.ADK
 
             var eventName = process == "subscribe" ? "channel-subscribe" : "channel-presence";
 
+            // [Request] outgoing WS frame (before send).
+            Debug.Log($"[{DateTime.Now:HH:mm:ss.fff}] [Request] WS OUT '{eventName}' ->\n" +
+                new JObject { ["channel"] = channel, ["process"] = process });
+
             var result = await handler.PushForSecureLine(eventName,
                 new Dictionary<string, object> { { "channel", channel } }, true);
+
+            // [Response] raw server response, exactly as received, BEFORE any parsing/validation.
+            Debug.Log($"[{DateTime.Now:HH:mm:ss.fff}] [Response] WS IN (raw) for '{eventName}' on '{channel}':\n" +
+                (result == null ? "null" : (result is JObject rjo ? rjo.ToString() : result.ToString())));
 
             if (result == null)
                 throw new ARTChannelNotFoundException(channel);
@@ -43,15 +51,30 @@ namespace ART.ADK
                     presenceUsers.Add(u.ToString());
             }
 
-            return new ChannelConfig
+            var config = new ChannelConfig
             {
                 ChannelName = data["channel"]?.ToString() ?? channel,
                 ChannelNamespace = data["channelNamespace"]?.ToString() ?? "",
                 ChannelType = rawData["TypeofChannel"]?.ToString() ?? "default",
                 PresenceUsers = presenceUsers,
                 Snapshot = data["snapshot"],
-                SubscriptionID = data["subscriptionID"]?.ToString()
+                SubscriptionID = data["subscriptionID"]?.ToString(),
+                OrchestratorEnabled = rawData["IsInterceptorEnabled"]?.ToObject<bool>() ?? false
             };
+
+            // [Response] parsed/deserialized ChannelConfig that callers receive.
+            Debug.Log($"[{DateTime.Now:HH:mm:ss.fff}] [Response] Parsed ChannelConfig for '{channel}':\n" +
+                new JObject
+                {
+                    ["channelName"] = config.ChannelName,
+                    ["channelType"] = config.ChannelType,
+                    ["channelNamespace"] = config.ChannelNamespace,
+                    ["subscriptionID"] = config.SubscriptionID,
+                    ["orchestratorEnabled"] = config.OrchestratorEnabled,
+                    ["presenceUsers"] = JArray.FromObject(presenceUsers)
+                });
+
+            return config;
         }
 
         public static async Task<bool> UnsubscribeFromChannel(
