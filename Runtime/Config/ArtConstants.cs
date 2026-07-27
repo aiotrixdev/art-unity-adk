@@ -9,5 +9,6 @@ namespace ART.ADK
         public static string WS_URL = "/v1/connect";
         public static string SSE_URL = "/v1/connect/sse";
         public static string LPOLL = "/v1/longpoll";
+        public static string CONFIG_JSON_PATH = "config.json";
     }
 }

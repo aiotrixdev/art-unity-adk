@@ -28,6 +28,9 @@ namespace ART.ADK
             = new Dictionary<string, (TaskCompletionSource<string>, CancellationTokenSource)>();
         private int _messageCount;
 
+        /// <summary>Server-ack wait window, mirrors the Kotlin ACK_TIMEOUT (50s).</summary>
+        private const int ACK_TIMEOUT_MS = 50_000;
+
         public BaseSubscription(
             string connectionID,
             ChannelConfig channelConfig,
@@ -79,7 +82,10 @@ namespace ART.ADK
             {
                 if (payload is JObject data)
                 {
-                    var error = data["error"]?.Value<bool>() ?? false;
+                    // Value<bool?> tolerates both an absent "error" key and an explicit
+                    // JSON null (data["error"] as JValue(Null)); Value<bool> would throw
+                    // InvalidCastException on the latter.
+                    var error = data["error"]?.Value<bool?>() ?? false;
                     if (error) return;
 
                     var usernames = data["usernames"]?.ToObject<List<string>>() ?? new List<string>();
@@ -106,7 +112,13 @@ namespace ART.ADK
                 }
             });
 
-            await Push("art_presence", new JObject());
+            // Fire-and-forget like the Kotlin fetchPresence (scope.launch { runCatching { push(...) } }):
+            // the presence request must not block or fail the caller on a missing ack.
+            _ = Task.Run(async () =>
+            {
+                try { await Push("art_presence", new JObject()); }
+                catch (Exception ex) { Debug.LogWarning($"[ART] art_presence push failed: {ex.Message}"); }
+            });
 
             return async () =>
             {
@@ -119,13 +131,16 @@ namespace ART.ADK
         }
 
         // ---- ACK ----
+        // Mirrors Kotlin BaseSubscription.acknowledge: acks are sent for EVERY channel
+        // except the reserved ones — orchestrator flows depend on MA/CA acks.
         public void Acknowledge(JObject request, string returnFlag)
         {
-            if (ChannelConfig.ChannelType != "targeted" && ChannelConfig.ChannelType != "secure")
+            var chName = ChannelConfig.ChannelName;
+            if (chName == "art_config" || chName == "art_secure" || chName == "art_presence")
                 return;
 
             var channel = request["channel"]?.ToString();
-            if (channel == "art_config" || channel == "art_secure" || channel == "art_presence")
+            if (string.IsNullOrEmpty(channel))
                 return;
 
             var response = new JObject
@@ -134,7 +149,7 @@ namespace ART.ADK
                 ["return_flag"] = returnFlag
             };
 
-            var keys = new[] { "id", "ref_id", "from", "to_username", "to",
+            var keys = new[] { "id", "ref_id", "from", "to_user_id", "to_username", "to",
                               "pipeline_id", "interceptor_name", "attempt_id" };
             foreach (var key in keys)
             {
@@ -151,12 +166,14 @@ namespace ART.ADK
             var refId = data["ref_id"]?.ToString();
             if (string.IsNullOrEmpty(refId)) return;
 
-            if (_pendingAcks.TryGetValue(refId, out var ack))
+            (TaskCompletionSource<string> tcs, CancellationTokenSource cts) ack;
+            lock (_pendingAcks)
             {
-                ack.cts.Cancel();
-                ack.tcs.TrySetResult(refId);
+                if (!_pendingAcks.TryGetValue(refId, out ack)) return;
                 _pendingAcks.Remove(refId);
             }
+            ack.cts.Cancel();
+            ack.tcs.TrySetResult(refId);
         }
 
         // ---- Subscribe ----
@@ -206,16 +223,34 @@ namespace ART.ADK
             if (ChannelConfig.ChannelName == "art_config" || ChannelConfig.ChannelName == "art_secure")
                 return;
 
+            // Scope reconnect logging to orchestrator channels so the [Connection] lifecycle is
+            // visible without spamming for every channel type.
+            var isOrchestratorChannel = ChannelConfig.ChannelName != null &&
+                                        ChannelConfig.ChannelName.StartsWith("orch_com_");
+            if (isOrchestratorChannel)
+                Debug.Log($"[{DateTime.Now:HH:mm:ss.fff}] [Connection] Reconnecting orchestrator channel '{ChannelConfig.ChannelName}'...");
+
             _ = Task.Run(async () =>
             {
                 if (IsListening)
                     await ValidateSubscription("presence");
                 await SubscribeAsync();
+
+                if (isOrchestratorChannel)
+                    Debug.Log($"[{DateTime.Now:HH:mm:ss.fff}] [Connection] Reconnected orchestrator channel '{ChannelConfig.ChannelName}'.");
             });
         }
 
         // ---- Push ----
-        public virtual async Task Push(string eventName, JObject data, PushOptions options = null)
+        /// <summary>
+        /// Send an event to the channel and await the server's "SA" ack (50s timeout), mirroring
+        /// the Kotlin <c>BaseSubscription.push</c>. Reserved channels (art_config / art_secure /
+        /// art_presence) resolve immediately without an ack. Returns
+        /// <c>{ "dispatched": bool, "message": &lt;full server-bound message&gt;, "ref_id": string }</c>.
+        /// When <see cref="PushOptions.ThreadId"/> is set it is serialized as a top-level
+        /// <c>thread_id</c> field on the frame (orchestrator thread scoping).
+        /// </summary>
+        public virtual async Task<JObject> Push(string eventName, JToken data, PushOptions options = null)
         {
             await WebSocketHandler.Wait();
 
@@ -225,7 +260,7 @@ namespace ART.ADK
 
             var to = options?.To ?? new List<string>();
 
-            var messageStr = data.ToString(Formatting.None);
+            var messageStr = (data ?? new JObject()).ToString(Formatting.None);
 
             // Targeted/secure validation
             if (ChannelConfig.ChannelType == "secure" || ChannelConfig.ChannelType == "targeted")
@@ -254,33 +289,67 @@ namespace ART.ADK
             }
 
             var fromId = connection.ConnectionId;
-           // var fromName = connection.ConnectionId;
-           // try { fromName = Auth.GetInstance().Username ?? fromName; } catch { }
 
+            // ---- Ref ID & ACK promise (mirrors Kotlin: pendingAcks + 50s timeout) ----
             string refId = null;
             var chName = ChannelConfig.ChannelName;
+            TaskCompletionSource<string> ackTcs;
+
             if (chName != "art_config" && chName != "art_secure" && chName != "art_presence")
             {
                 _messageCount++;
                 refId = $"{fromId}_{chName}_{_messageCount}";
+
+                ackTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var cts = new CancellationTokenSource();
+                var capturedRefId = refId;
+                _ = Task.Delay(ACK_TIMEOUT_MS, cts.Token).ContinueWith(t =>
+                {
+                    if (t.IsCanceled) return;
+                    lock (_pendingAcks) { _pendingAcks.Remove(capturedRefId); }
+                    ackTcs.TrySetException(new ARTServerException("ACK timeout"));
+                }, TaskContinuationOptions.ExecuteSynchronously);
+
+                lock (_pendingAcks) { _pendingAcks[refId] = (ackTcs, cts); }
+            }
+            else
+            {
+                ackTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                ackTcs.TrySetResult(null);
             }
 
-            var channelFull = chName;
-            if (!string.IsNullOrEmpty(ChannelConfig.ChannelNamespace))
-                channelFull += $":{ChannelConfig.ChannelNamespace}";
-
+            // Kotlin push sends the plain channel name (no namespace suffix).
             var message = new JObject
             {
                 ["from"] = connection.ConnectionId,
                 ["to"] = JArray.FromObject(to),
-                ["channel"] = channelFull,
+                ["channel"] = chName,
                 ["event"] = eventName,
                 ["content"] = messageStr
             };
 
             if (refId != null)
                 message["ref_id"] = refId;
-            WebSocketHandler.SendMessage(message.ToString(Formatting.None));
+
+            // Orchestrator thread scoping — top-level frame field, like the Kotlin SDK.
+            if (!string.IsNullOrEmpty(options?.ThreadId))
+                message["thread_id"] = options.ThreadId;
+
+            var wire = message.ToString(Formatting.None);
+            var dispatched = WebSocketHandler.SendMessage(wire);
+            Debug.Log($"[ART] Push message '{eventName}' -> server ({(dispatched ? "sent" : "queued (socket not open)")}): {wire}");
+
+            // Await the server ack (Kotlin: ackDeferred.await()). Throws ARTServerException
+            // ("ACK timeout") if the server does not acknowledge within the timeout.
+            await ackTcs.Task;
+
+            var result = new JObject
+            {
+                ["dispatched"] = dispatched,
+                ["message"] = message
+            };
+            if (refId != null) result["ref_id"] = refId;
+            return result;
         }
 
         public async Task PushArray(string eventName, JArray data)

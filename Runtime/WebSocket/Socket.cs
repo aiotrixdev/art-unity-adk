@@ -26,7 +26,7 @@ namespace ART.ADK
         // WebSocket state
         private ClientWebSocket _ws;
         private CancellationTokenSource _wsCts;
-        private AuthenticationConfig _credentials = new AuthenticationConfig();
+        private CredentialStore _credentials = new CredentialStore();
         private readonly Dictionary<string, BaseSubscription> _subscriptions = new Dictionary<string, BaseSubscription>();
         private readonly Dictionary<string, Interceptor> _interceptors = new Dictionary<string, Interceptor>();
         private ConnectionDetail _connection;
@@ -98,7 +98,7 @@ namespace ART.ADK
         }
 
         // ---- InitiateSocket ----
-        internal async Task InitiateSocket(AuthenticationConfig credentials)
+        internal async Task InitiateSocket(CredentialStore credentials)
         {
             if (_ws != null && IsConnectionActive) return;
             _credentials = credentials;
@@ -500,10 +500,10 @@ namespace ART.ADK
                 return;
             }
 
-            // Subscription routing
+            // Subscription routing — keyed by plain channel name, exactly like the Kotlin
+            // socket (subscriptions[channel]); subscriptions are also stored by plain name,
+            // so including the namespace here would orphan namespaced frames in the buffer.
             var subKey = channel;
-            if (!string.IsNullOrEmpty(ns))
-                subKey += $":{ns}";
 
             if (_subscriptions.TryGetValue(subKey, out var sub))
             {

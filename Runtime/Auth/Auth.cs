@@ -17,7 +17,7 @@ namespace ART.ADK
         private static Auth _instance;
         private static readonly object _lock = new object();
 
-        private AuthenticationConfig _credentials;
+        public CredentialStore _credentials;
         private AuthData _authData = new AuthData();
 
         public string UserId
@@ -50,12 +50,12 @@ namespace ART.ADK
             }
         }
 
-        private Auth(AuthenticationConfig credentials)
+        private Auth(CredentialStore credentials)
         {
             _credentials = credentials;
         }
 
-        public static Auth GetInstance(AuthenticationConfig credentials = null)
+        public static Auth GetInstance(CredentialStore credentials = null)
         {
             lock (_lock)
             {
@@ -80,16 +80,16 @@ namespace ART.ADK
                 return _authData;
 
             // Refresh credentials via hook if present
-            if (_credentials.GetCredentials != null)
-            {
-                var cred = _credentials.GetCredentials();
-                _credentials.AccessToken = cred.AccessToken;
-                _credentials.ClientID = cred.ClientID;
-                _credentials.ClientSecret = cred.ClientSecret;
-                _credentials.OrgTitle = cred.OrgTitle;
-                _credentials.Environment = cred.Environment;
-                _credentials.ProjectKey = cred.ProjectKey;
-            }
+            // if (_credentials.GetCredentials != null)
+            // {
+            //     var cred = _credentials.GetCredentials();
+            //     _credentials.AccessToken = cred.AccessToken;
+            //     _credentials.ClientID = cred.ClientID;
+            //     _credentials.ClientSecret = cred.ClientSecret;
+            //     _credentials.OrgTitle = cred.OrgTitle;
+            //     _credentials.Environment = cred.Environment;
+            //     _credentials.ProjectKey = cred.ProjectKey;
+            // }
 
             if (string.IsNullOrEmpty(_credentials.OrgTitle) ||
                 string.IsNullOrEmpty(_credentials.Environment) ||
@@ -107,7 +107,7 @@ namespace ART.ADK
         }
 
         public AuthData GetAuthData() => _authData;
-        public AuthenticationConfig GetCredentials() => _credentials;
+        public CredentialStore GetCredentials() => _credentials;
 
         private async Task<AuthData> GenerateAuthToken()
         {
