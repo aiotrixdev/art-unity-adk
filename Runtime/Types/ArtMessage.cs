@@ -79,5 +79,7 @@ namespace ART.ADK
         public object Snapshot { get; set; }
         public string SubscriptionID { get; set; }
         public bool OrchestratorEnabled { get; set; }
+       public string ConfigurationID { get; set; } 
+
     }
 }

@@ -14,7 +14,7 @@ namespace ART.ADK
         public static async Task<ChannelConfig> SubscribeToChannel(
             string channel, string process, IWebSocketHandler handler)
         {
-            await handler.Wait();
+            await handler.WaitForConnection();
 
             var eventName = process == "subscribe" ? "channel-subscribe" : "channel-presence";
 
@@ -80,7 +80,7 @@ namespace ART.ADK
         public static async Task<bool> UnsubscribeFromChannel(
             string channel, string subscriptionID, string process, IWebSocketHandler handler)
         {
-            await handler.Wait();
+            await handler.WaitForConnection();
 
             var eventName = process == "subscribe" ? "channel-unsubscribe" : "presence-unsubscribe";
 
@@ -106,7 +106,7 @@ namespace ART.ADK
         public static async Task<object> GetInterceptorConfig(
             string interceptor, IWebSocketHandler handler)
         {
-            await handler.Wait();
+            await handler.WaitForConnection();
 
             var result = await handler.PushForSecureLine("interceptor-subscribe",
                 new Dictionary<string, object> { { "interceptor", interceptor } }, true);
