@@ -8,14 +8,17 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
+using UnityEngine.Networking;
+
 
 namespace ART.ADK
 {
     /// <summary>
     /// Core WebSocket handler. Manages the connection lifecycle, message routing,
-    /// heartbeat, and fallback to long-polling.
-    /// Uses System.Net.WebSockets.ClientWebSocket (works on all platforms except WebGL).
-    /// For WebGL, a JS bridge plugin would be needed (flagged as limitation).
+    /// heartbeat, authorization refresh and fallback to long-polling.
+    /// Mirrors <c>websocket/socket.ts</c>. Uses System.Net.WebSockets.ClientWebSocket
+    /// (works on all platforms except WebGL). The JS SSE fallback is not ported
+    /// (Unity has no EventSource); the fallback chain is WebSocket -> long-poll.
     /// </summary>
     public sealed class Socket : IWebSocketHandler
     {
@@ -23,9 +26,13 @@ namespace ART.ADK
         private static Socket _instance;
         private static readonly object _singletonLock = new object();
 
+        // Shared-state lock (subscriptions, interceptors, pending buffers, failure state)
+        private readonly object _stateLock = new object();
+
         // WebSocket state
         private ClientWebSocket _ws;
         private CancellationTokenSource _wsCts;
+        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
         private CredentialStore _credentials = new CredentialStore();
         private readonly Dictionary<string, BaseSubscription> _subscriptions = new Dictionary<string, BaseSubscription>();
         private readonly Dictionary<string, Interceptor> _interceptors = new Dictionary<string, Interceptor>();
@@ -45,17 +52,28 @@ namespace ART.ADK
         public bool IsReConnecting { get; set; }
         private bool _autoReconnect;
 
-        // Long poll client
-        private LongPollClient _lpClient;
-        private string _pullSource = "socket";
-        private string _pushSource = "socket";
+        // Connection lifecycle (JS: connectionFailure / connectionGeneration / connectionTimeoutMs)
+        private ConnectionError _connectionFailure;
+        private int _connectionGeneration;
+        private long _connectionTimeoutMs = 30_000L;
+        private string _authorizedAccessToken = "";
+        private Task _authorizationRefreshInFlight;
 
-        // Event emitter
+        // Long poll client
+        private readonly LongPollClient _lpClient;
+        private string _pullSource = "socket"; // "socket" | "http"
+        private string _pushSource = "socket"; // "socket" | "http"
+
+        // Event emitter ("open", "close", "error", "connection", "limitExceeded",
+        // "authenticationFailed", "connectionFailed")
         private readonly EventEmitter _emitter = new EventEmitter();
 
         // Connection waiters
         private readonly List<TaskCompletionSource<bool>> _connectionWaiters = new List<TaskCompletionSource<bool>>();
         private readonly object _waiterLock = new object();
+
+        // Connection failure listeners (also surfaced as the "connectionFailed" event)
+        private readonly List<Action<ConnectionError>> _failureListeners = new List<Action<ConnectionError>>();
 
         private Socket(
             Func<string, string, Task<string>> encrypt,
@@ -69,7 +87,7 @@ namespace ART.ADK
                 Endpoint = ArtConstants.LPOLL,
                 GetAuthHeaders = async () =>
                 {
-                    var auth = Auth.GetInstance(_credentials);
+                    var auth = Auth.GetInstance();
                     var authData = await auth.Authenticate();
                     var creds = auth.GetCredentials();
                     return new Dictionary<string, string>
@@ -81,7 +99,11 @@ namespace ART.ADK
                     };
                 },
                 OnMessages = messages => ProcessIncomingMessages(messages),
-                OnError = err => Debug.Log($"[ART] LP error: {err}")
+                OnError = err =>
+                {
+                    if (AuthErrors.IsTerminalAuthError(err)) StopAfterAuthenticationFailure(new Exception(err));
+                    else Debug.LogError($"[ART] LP error: {err}");
+                }
             });
         }
 
@@ -97,13 +119,91 @@ namespace ART.ADK
             }
         }
 
-        // ---- InitiateSocket ----
+        // =====================================================================
+        // Connection lifecycle (JS: beginConnection / failConnection / on|offConnectionFailure)
+        // =====================================================================
+
+        /// <summary>Starts a new connection cycle: clears any previous failure and sets the wait timeout.</summary>
+        public void BeginConnection(long timeoutMs = 30_000L)
+        {
+            if (timeoutMs <= 0) throw new ArgumentException("ConnectionTimeoutMs must be positive");
+            _connectionTimeoutMs = timeoutMs;
+            lock (_stateLock) { _connectionFailure = null; }
+            Interlocked.Increment(ref _connectionGeneration);
+        }
+
+        /// <summary>
+        /// Fails the connection: stops everything, rejects all waiters and listeners and closes the socket.
+        /// Only the first failure of a cycle is applied.
+        /// </summary>
+        public void FailConnection(ConnectionError error)
+        {
+            lock (_stateLock)
+            {
+                if (_connectionFailure != null) return;
+                _connectionFailure = error;
+            }
+
+            Interlocked.Increment(ref _connectionGeneration);
+            IsConnectionActive = false;
+            _isConnecting = false;
+            IsReConnecting = false;
+            _autoReconnect = false;
+            PendingSendMessages = new List<string>();
+            try { _lpClient.Stop(); } catch { }
+
+            // Reject everything waiting for the connection.
+            List<TaskCompletionSource<bool>> waiters;
+            lock (_waiterLock)
+            {
+                waiters = new List<TaskCompletionSource<bool>>(_connectionWaiters);
+                _connectionWaiters.Clear();
+            }
+            foreach (var w in waiters) w.TrySetException(error);
+
+            // Notify failure listeners + the "connectionFailed" event.
+            List<Action<ConnectionError>> listeners;
+            lock (_failureListeners) { listeners = new List<Action<ConnectionError>>(_failureListeners); }
+            foreach (var l in listeners)
+            {
+                try { l(error); } catch (Exception ex) { Debug.LogException(ex); }
+            }
+            _emitter.Emit("connectionFailed", error);
+
+            _ = CloseWebSocket().ContinueWith(t => { var _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        public void OnConnectionFailure(Action<ConnectionError> listener)
+        {
+            lock (_failureListeners) { _failureListeners.Add(listener); }
+        }
+
+        public void OffConnectionFailure(Action<ConnectionError> listener)
+        {
+            lock (_failureListeners) { _failureListeners.Remove(listener); }
+        }
+
+        private int CurrentGeneration => Volatile.Read(ref _connectionGeneration);
+
+        // The failure if there is one, otherwise the fallback (JS: `this.connectionFailure || err`).
+        private Exception FailureOr(Exception fallback) => (Exception)_connectionFailure ?? fallback;
+
+        private static ConnectionError CancelledError() =>
+            new ConnectionError("Connection attempt cancelled.", "CONNECTION_CANCELLED");
+
+        // =====================================================================
+        // InitiateSocket / ConnectWebSocket
+        // =====================================================================
+
         internal async Task InitiateSocket(CredentialStore credentials)
         {
+            var generation = CurrentGeneration;
+            if (_connectionFailure != null) throw _connectionFailure;
             if (_ws != null && IsConnectionActive) return;
+
             _credentials = credentials;
 
-            // Try WebSocket
+            // 1) WebSocket
             try
             {
                 await ConnectWebSocket();
@@ -111,100 +211,146 @@ namespace ART.ADK
                 _pushSource = "socket";
                 return;
             }
-            catch (Exception ex)
+            catch (Exception wsErr)
             {
-                Debug.Log($"[ART] WebSocket failed, falling back to LongPoll: {ex.Message}");
+                if (generation != CurrentGeneration) throw FailureOr(wsErr);
+                if (_connectionFailure != null) throw _connectionFailure;
+                Debug.LogWarning($"[ART] WebSocket failed, falling back to LongPoll: {wsErr.Message}");
             }
 
-            // Fallback: LongPoll
+            // 2) Long poll (JS also tries SSE here; not available in Unity)
             _pullSource = "http";
             _pushSource = "http";
             _lpClient.Start(_connection?.ConnectionId);
         }
 
-        // ---- ConnectWebSocket ----
         public async Task ConnectWebSocket()
         {
-            if (_isConnecting) return;
-            _isConnecting = true;
-
-            AuthData authData;
+            var generation = CurrentGeneration;
             try
             {
+                if (_connectionFailure != null) throw _connectionFailure;
+                if (_isConnecting) return;
+                _isConnecting = true;
+
                 var auth = Auth.GetInstance(_credentials);
-                authData = await auth.Authenticate(forceAuth: IsReConnecting);
+
+                AuthData authData;
+                try
+                {
+                    authData = await auth.Authenticate(forceAuth: IsReConnecting);
+                }
+                catch (Exception err)
+                {
+                    if (generation != CurrentGeneration) throw FailureOr(err);
+                    Debug.LogError($"[ART] Authentication failed: {err.Message}");
+                    _isConnecting = false;
+                    // Authentication is not a transport outage. A failed forced refresh during
+                    // reconnect must end that reconnect cycle instead of retrying forever.
+                    if (IsReConnecting || AuthErrors.IsTerminalAuthError(err))
+                    {
+                        StopAfterAuthenticationFailure(err);
+                        throw _connectionFailure;
+                    }
+                    throw;
+                }
+                if (generation != CurrentGeneration) throw FailureOr(CancelledError());
+
+                var wsUrl = $"{ArtConstants.WS_URL}" +
+                    $"?connection_id={Uri.EscapeDataString(_connection?.ConnectionId ?? "")}" +
+                    $"&Org-Title={Uri.EscapeDataString(_credentials.OrgTitle)}" +
+                    $"&token={Uri.EscapeDataString(authData.AccessToken)}" +
+                    $"&environment={Uri.EscapeDataString(_credentials.Environment)}" +
+                    $"&project-key={Uri.EscapeDataString(_credentials.ProjectKey)}";
+
+                await SafeClose();
+                if (generation != CurrentGeneration) throw FailureOr(CancelledError());
+
+                var cts = new CancellationTokenSource();
+                _wsCts = cts;
+                var ws = new ClientWebSocket();
+                _ws = ws;
+
+                try
+                {
+                    var connectTask = ws.ConnectAsync(new Uri(wsUrl), cts.Token);
+                    var completed = await Task.WhenAny(connectTask, Task.Delay(5000));
+
+                    if (completed != connectTask)
+                    {
+                        cts.Cancel();
+                        DiscardSocket(ws);
+                        throw new ARTTimeoutException("WebSocket handshake timeout");
+                    }
+
+                    await connectTask; // propagate any exception
+
+                    if (generation != CurrentGeneration)
+                    {
+                        DiscardSocket(ws);
+                        throw FailureOr(CancelledError());
+                    }
+
+                    _isConnecting = false;
+                    _authorizedAccessToken = authData.AccessToken;
+                    _emitter.Emit("open");
+                    _ = StartReceiveLoop(ws, cts.Token, generation);
+                }
+                catch (ARTTimeoutException) { throw; }
+                catch (ConnectionError) { throw; }
+                catch (Exception ex)
+                {
+                    DiscardSocket(ws);
+                    _isConnecting = false;
+                    if (generation == CurrentGeneration) _emitter.Emit("close", ex);
+                    throw new ARTException($"WebSocket connection failed: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            catch
             {
-                _isConnecting = false;
-                _emitter.Emit("close", ex);
-                throw;
-            }
-
-            var wsUrl = $"{ArtConstants.WS_URL}" +
-                $"?connection_id={Uri.EscapeDataString(_connection?.ConnectionId ?? "")}" +
-                $"&Org-Title={Uri.EscapeDataString(_credentials.OrgTitle)}" +
-                $"&token={Uri.EscapeDataString(authData.AccessToken)}" +
-                $"&environment={Uri.EscapeDataString(_credentials.Environment)}" +
-                $"&project-key={Uri.EscapeDataString(_credentials.ProjectKey)}";
-
-            // Close existing connection
-            await SafeClose();
-
-            _wsCts = new CancellationTokenSource();
-            _ws = new ClientWebSocket();
-
-            try
-            {
-                var connectTask = _ws.ConnectAsync(new Uri(wsUrl), _wsCts.Token);
-                var timeoutTask = Task.Delay(5000);
-                var completed = await Task.WhenAny(connectTask, timeoutTask);
-
-                if (completed == timeoutTask)
+                if (generation == CurrentGeneration)
                 {
                     _isConnecting = false;
-                    _wsCts.Cancel();
-                    throw new ARTTimeoutException("WebSocket handshake timeout");
+                    IsConnectionActive = false;
                 }
-
-                await connectTask; // propagate any exception
-                _isConnecting = false;
-                _emitter.Emit("open");
-                _ = StartReceiveLoop();
-            }
-            catch (ARTTimeoutException)
-            {
                 throw;
             }
-            catch (Exception ex)
-            {
-                _isConnecting = false;
-                throw new ARTException($"WebSocket connection failed: {ex.Message}");
-            }
+        }
+
+        private void DiscardSocket(ClientWebSocket ws)
+        {
+            if (ReferenceEquals(_ws, ws)) _ws = null;
+            try { ws.Dispose(); } catch { }
         }
 
         private async Task SafeClose()
         {
-            if (_ws == null) return;
+            var ws = _ws;
+            if (ws == null) return;
+            _ws = null; // detach first so the receive loop ignores its own close
+
             try
             {
-                if (_ws.State == WebSocketState.Open || _ws.State == WebSocketState.CloseReceived)
+                if (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseReceived)
                 {
                     using var cts = new CancellationTokenSource(1000);
-                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", cts.Token);
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", cts.Token);
                 }
             }
             catch { }
             finally
             {
-                _ws?.Dispose();
-                _ws = null;
+                try { ws.Dispose(); } catch { }
             }
         }
 
-        // ---- Connection binding (art_ready) ----
+        // =====================================================================
+        // Connection binding (art_ready)
+        // =====================================================================
+
         private void HandleConnectionBinding(string rawData)
         {
+            if (_connectionFailure != null) return;
             SetAutoReconnect(true);
 
             JObject data;
@@ -220,84 +366,224 @@ namespace ART.ADK
                 ProjectKey = _credentials.ProjectKey
             };
 
-            _emitter.Emit("connection", _connection);
+            Debug.Log($"[ART] Live connection opened {_connection.ConnectionId}");
             IsConnectionActive = true;
+            IsReConnecting = false;
+            _emitter.Emit("connection", _connection);
             StartHeartbeat();
             ResolveWaiters();
 
-            // Flush pending messages
-            var queued = new List<string>(PendingSendMessages);
-            PendingSendMessages.Clear();
-            foreach (var msg in queued)
-                SendMessage(msg);
-
             if (_autoReconnect)
             {
-                foreach (var sub in _subscriptions.Values.ToList())
-                    sub.Reconnect();
-                foreach (var inter in _interceptors.Values.ToList())
-                    inter.Reconnect();
+                List<BaseSubscription> subs;
+                List<Interceptor> inters;
+                lock (_stateLock)
+                {
+                    subs = _subscriptions.Values.ToList();
+                    inters = _interceptors.Values.ToList();
+                }
+                foreach (var sub in subs) sub.Reconnect();
+                foreach (var inter in inters) inter.Reconnect();
             }
         }
 
-        // ---- IWebSocketHandler: PushForSecureLine ----
-        public async Task<object> PushForSecureLine(string eventName, object data, bool listen)
+        // =====================================================================
+        // Secure line + authorization
+        // =====================================================================
+
+        /// <summary>
+        /// Sends an event on the reserved art_secure channel. With <paramref name="listen"/> it waits
+        /// for the server's reply (rejecting on timeout or connection failure); otherwise returns null.
+        /// </summary>
+        public async Task<object> PushForSecureLine(string eventName, object data, bool listen = false)
         {
-            var connId = _connection?.ConnectionId ?? "";
-            var rand = UnityEngine.Random.Range(0, 1000000).ToString();
-            var refId = $"{connId}_secure_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{rand}";
+            await WaitForConnection();
 
-            string content;
-            try { content = JsonConvert.SerializeObject(data); }
-            catch { content = "{}"; }
+            var refId = $"{_connection?.ConnectionId}_secure_{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}_{Guid.NewGuid().ToString("N").Substring(0, 6)}";
 
-            string fromId   = connId;
-            var fromName = connId;
-            try { fromName = Auth.GetInstance().Username ?? fromId; } catch { }
-
-            var payload = new JObject
+            var message = new JObject
             {
-                ["from"] = fromId,
-                ["from_username"] = fromName,
-                ["from_id"] = fromId,
+                ["from"] = _connection?.ConnectionId ?? "",
                 ["channel"] = "art_secure",
                 ["event"] = eventName,
-                ["content"] = content,
+                ["content"] = JsonConvert.SerializeObject(data ?? new JObject()),
                 ["ref_id"] = refId
             };
-
-            var msgStr = payload.ToString(Formatting.None);
+            var msgStr = message.ToString(Formatting.None);
 
             if (!listen)
             {
-                SendMessage(msgStr);
+                try
+                {
+                    SendMessage(msgStr);
+                }
+                catch (Exception error)
+                {
+                    FailConnection(error as ConnectionError ?? new ConnectionError("The connection was lost.", "CONNECTION_LOST"));
+                    throw;
+                }
                 return null;
             }
 
-            var tcs = new TaskCompletionSource<object>();
-            SecureCallbacks[$"secure-{refId}"] = result => {
-                tcs.TrySetResult(result);
-            };
-            SendMessage(msgStr);
+            var key = $"secure-{refId}";
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var timerCts = new CancellationTokenSource();
+            Action<ConnectionError> onFailure = null;
 
-            // Timeout after 30s
-            var timeoutTask = Task.Delay(30000);
-            var completed = await Task.WhenAny(tcs.Task, timeoutTask);
-            if (completed == timeoutTask)
+            void Cleanup()
             {
-                SecureCallbacks.Remove($"secure-{refId}");
-                return null;
+                timerCts.Cancel();
+                if (onFailure != null) OffConnectionFailure(onFailure);
+                lock (SecureCallbacks) { SecureCallbacks.Remove(key); }
             }
+
+            onFailure = error => { Cleanup(); tcs.TrySetException(error); };
+
+            _ = Task.Delay((int)Math.Min(_connectionTimeoutMs, int.MaxValue), timerCts.Token).ContinueWith(t =>
+            {
+                if (t.IsCanceled) return;
+                onFailure(new ConnectionError(
+                    "The connection did not respond in time. Please reconnect and try again.", "CONNECTION_TIMEOUT"));
+            }, TaskContinuationOptions.ExecuteSynchronously);
+
+            OnConnectionFailure(onFailure);
+            lock (SecureCallbacks)
+            {
+                SecureCallbacks[key] = reply => { Cleanup(); tcs.TrySetResult(reply); };
+            }
+
+            try
+            {
+                SendMessage(msgStr);
+            }
+            catch (Exception error)
+            {
+                FailConnection(error as ConnectionError ?? new ConnectionError("The connection was lost.", "CONNECTION_LOST"));
+                Cleanup();
+                tcs.TrySetException(error);
+            }
+
             return await tcs.Task;
         }
 
-        // ---- IWebSocketHandler: RemoveSubscription ----
-        public void RemoveSubscription(string channel)
+        /// <summary>
+        /// Makes sure the connection's access token is current, refreshing the server-side
+        /// authorization lease when the token changed.
+        /// </summary>
+        public async Task EnsureAuthorization()
         {
-            _subscriptions.Remove(channel);
+            await WaitForConnection();
+
+            var inFlight = _authorizationRefreshInFlight;
+            if (inFlight != null)
+            {
+                await inFlight;
+                return;
+            }
+
+            var auth = Auth.GetInstance(_credentials);
+            string accessToken;
+            try
+            {
+                accessToken = (await auth.Authenticate()).AccessToken;
+            }
+            catch (Exception error)
+            {
+                StopAfterAuthenticationFailure(error);
+                throw _connectionFailure;
+            }
+            if (_connectionFailure != null) throw _connectionFailure;
+
+            if (accessToken == _authorizedAccessToken) return;
+
+            var pending = RefreshAuthorizationLease(accessToken);
+            _authorizationRefreshInFlight = pending;
+            try
+            {
+                await pending;
+            }
+            finally
+            {
+                _authorizationRefreshInFlight = null;
+            }
         }
 
-        // ---- Subscribe ----
+        private async Task RefreshAuthorizationLease(string accessToken)
+        {
+            var connectionId = _connection?.ConnectionId;
+            if (string.IsNullOrEmpty(connectionId))
+                throw new InvalidOperationException("Connection is not ready for authorization refresh");
+
+            var body = new JObject
+            {
+                ["channel"] = "art_secure",
+                ["event"] = "authorization-refresh",
+                ["content"] = "{}",
+                ["connection_id"] = connectionId,
+                ["to"] = new JArray()
+            };
+
+            using var request = new UnityWebRequest($"{ArtConstants.BASE_URL}/v1/push-message", "POST");
+            request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body.ToString(Formatting.None)));
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.SetRequestHeader("Accept", "application/json");
+            request.SetRequestHeader("X-Org", _credentials.OrgTitle);
+            request.SetRequestHeader("Environment", _credentials.Environment);
+            request.SetRequestHeader("ProjectKey", _credentials.ProjectKey);
+
+            var res = await SendRequest(request, _connectionTimeoutMs);
+
+            if (res.TimedOut || res.NetworkError)
+            {
+                throw new ConnectionError(
+                    res.TimedOut
+                        ? "Connection authorization timed out. Please reconnect."
+                        : $"Connection authorization failed: {res.Error ?? "network error"}",
+                    "CONNECTION_AUTHORIZATION_FAILED");
+            }
+
+            if (res.Status < 200 || res.Status >= 300)
+            {
+                var json = TryParseObject(res.Text);
+                var msg = json?["message"]?.ToString();
+                var error = new AuthHttpError(
+                    string.IsNullOrEmpty(msg) ? $"HTTP {res.Status} {res.Error}" : msg,
+                    (int)res.Status,
+                    json);
+                if (AuthErrors.IsTerminalAuthError(error)) StopAfterAuthenticationFailure(error);
+                throw error;
+            }
+
+            _authorizedAccessToken = accessToken;
+        }
+
+        private void StopAfterAuthenticationFailure(Exception error)
+        {
+            int? status = (error as AuthHttpError)?.Status;
+            var failure = new ConnectionError(
+                string.IsNullOrEmpty(error?.Message) ? "Authentication failed. Please sign in again." : error.Message,
+                "AUTHENTICATION_FAILED",
+                status);
+            FailConnection(failure);
+
+            _emitter.Emit("authenticationFailed", new JObject
+            {
+                ["status"] = AuthErrors.IsTerminalAuthError(error) ? (status ?? 0) : 0,
+                ["error"] = error?.Message ?? "Authentication refresh failed"
+            });
+        }
+
+        // =====================================================================
+        // Subscriptions
+        // =====================================================================
+
+        public void RemoveSubscription(string channel)
+        {
+            lock (_stateLock) { _subscriptions.Remove(channel); }
+        }
+
         public async Task<BaseSubscription> Subscribe(string channel)
         {
             return await HandleSubscription(channel);
@@ -305,10 +591,13 @@ namespace ART.ADK
 
         private async Task<BaseSubscription> HandleSubscription(string channel)
         {
-            await Wait();
+            await WaitForConnection();
+            await EnsureAuthorization();
             var connectionId = _connection?.ConnectionId ?? "";
 
-            if (_subscriptions.TryGetValue(channel, out var existing))
+            BaseSubscription existing;
+            lock (_stateLock) { _subscriptions.TryGetValue(channel, out existing); }
+            if (existing != null)
             {
                 await existing.SubscribeAsync();
                 return existing;
@@ -320,42 +609,58 @@ namespace ART.ADK
 
             BaseSubscription subscription;
             if (channelConfig.ChannelType == "shared-object")
-            {
                 subscription = new SharedObjectChannel(connectionId, channelConfig, this, "subscribe");
-            }
             else
-            {
                 subscription = new Subscription(connectionId, channelConfig, this, "subscribe");
-            } 
 
-            _subscriptions[channel] = subscription;
+            lock (_stateLock) { _subscriptions[channel] = subscription; }
 
             // Replay buffered messages
-            if (_pendingIncomingMessages.TryGetValue(channel, out var buf))
+            foreach (var item in TakeBufferedMessages(channel))
             {
-                foreach (var item in buf)
-                    await subscription.HandleMessage(item.evt, item.payload);
-                _pendingIncomingMessages.Remove(channel);
+                try { await subscription.HandleMessage(item.evt, item.payload); }
+                catch (Exception ex) { Debug.LogException(ex); }
             }
 
             return subscription;
         }
 
+        // Buffered frames are stored under "channel[:namespace]" (JS key). A subscription made with the
+        // plain channel name also receives frames buffered under its namespaced variants.
+        private List<(string evt, JObject payload)> TakeBufferedMessages(string channel)
+        {
+            var result = new List<(string evt, JObject payload)>();
+            lock (_stateLock)
+            {
+                foreach (var key in _pendingIncomingMessages.Keys.ToList())
+                {
+                    var matches = key == channel ||
+                                  (!channel.Contains(":") && key.StartsWith(channel + ":", StringComparison.Ordinal));
+                    if (!matches) continue;
+                    result.AddRange(_pendingIncomingMessages[key]);
+                    _pendingIncomingMessages.Remove(key);
+                }
+            }
+            return result;
+        }
+
         private async Task<ChannelConfig> ValidateSubscription(string channelName, string process)
         {
-            if (channelName == "art_config" || channelName == "art_secure")
+            if (channelName == "art_config" || channelName == "art_secure" || channelName == "art_notifications")
             {
                 return new ChannelConfig
                 {
                     ChannelName = channelName,
                     ChannelNamespace = "",
-                    ChannelType = "default"
+                    ChannelType = "default",
+                    PresenceUsers = new List<string>(),
+                    SubscriptionID = "",
+                    OrchestratorEnabled = false
                 };
             }
             return await HelperFunctions.SubscribeToChannel(channelName, process, this);
         }
 
-        // ---- IWebSocketHandler: GetConnection ----
         public ConnectionDetail GetConnection() => _connection;
 
         // ---- Intercept ----
@@ -363,18 +668,24 @@ namespace ART.ADK
             string interceptorName,
             Action<JObject, Action<object>, Action<string>> fn)
         {
-            await Wait();
+            await WaitForConnection();
 
-            if (_interceptors.TryGetValue(interceptorName, out var existing))
-                return existing;
+            lock (_stateLock)
+            {
+                if (_interceptors.TryGetValue(interceptorName, out var existing))
+                    return existing;
+            }
 
             var interception = new Interceptor(interceptorName, fn, this);
             await interception.ValidateInterception();
-            _interceptors[interceptorName] = interception;
+            lock (_stateLock) { _interceptors[interceptorName] = interception; }
             return interception;
         }
 
-        // ---- Message parsing ----
+        // =====================================================================
+        // Incoming messages
+        // =====================================================================
+
         private void ParseIncomingMessage(string message)
         {
             try
@@ -395,7 +706,7 @@ namespace ART.ADK
             }
             catch (Exception ex)
             {
-                Debug.Log($"[ART] Parse error: {ex.Message}");
+                Debug.LogError($"[ART] Failed to parse incoming message: {ex.Message}");
             }
         }
 
@@ -407,190 +718,367 @@ namespace ART.ADK
 
         private void HandleIncomingMessage(JObject parsed)
         {
-            var channel = parsed["channel"]?.ToString();
-            if (string.IsNullOrEmpty(channel) && parsed["event"] == null)
+            try
             {
-                return;
-            }
+                var channel = parsed["channel"]?.ToString();
+                var evt = parsed["event"]?.ToString() ?? "";
+                var refId = parsed["ref_id"]?.ToString() ?? "";
+                var returnFlag = parsed["return_flag"]?.ToString() ?? "";
+                var interceptorName = parsed["interceptor_name"]?.ToString();
+                var ns = parsed["namespace"]?.ToString() ?? "";
+                var rawData = parsed["content"];
 
-            var evt = parsed["event"]?.ToString() ?? "";
-            var refId = parsed["ref_id"]?.ToString() ?? "";
-            var returnFlag = parsed["return_flag"]?.ToString() ?? "";
-            var interceptorName = parsed["interceptor_name"]?.ToString();
-            var ns = parsed["namespace"]?.ToString() ?? "";
-            var rawData = parsed["content"];
-
-            // art_ready -> connection binding
-            if (channel == "art_ready" && evt == "ready")
-            {
-                MainThreadDispatcher.Enqueue(() =>
-                    HandleConnectionBinding(rawData?.ToString() ?? ""));
-                return;
-            }
-
-            // art_secure -> secure callback
-            if (channel == "art_secure")
-            {
-                var key = $"secure-{refId}";
-                if (SecureCallbacks.TryGetValue(key, out var cb))
+                // art_ready -> connection binding
+                if (channel == "art_ready" && evt == "ready")
                 {
-                    var dataDict = new JObject
-                    {
-                        ["channel"] = channel,
-                        ["namespace"] = ns,
-                        ["ref_id"] = refId,
-                        ["event"] = evt
-                    };
-
-                    if (rawData != null)
-                    {
-                        try
-                        {
-                            var innerParsed = JObject.Parse(rawData.ToString());
-                            dataDict["data"] = innerParsed;
-                        }
-                        catch { }
-                    }
-
-                    var result = new JObject
-                    {
-                        ["data"] = dataDict["data"],
-                        ["channel"] = channel,
-                        ["namespace"] = ns,
-                        ["ref_id"] = refId,
-                        ["event"] = evt
-                    };
-
-                    cb(result);
-                    SecureCallbacks.Remove(key);
+                    MainThreadDispatcher.Enqueue(() =>
+                        HandleConnectionBinding(rawData?.ToString() ?? ""));
+                    return;
                 }
-                return;
-            }
 
-            if (string.IsNullOrEmpty(channel) || (string.IsNullOrEmpty(evt) && returnFlag != "SA"))
-            {
-                return;
-            }
-
-            if (evt == "shift_to_http")
-            {
-                SwitchToHttpPoll();
-                return;
-            }
-
-            // Build payload with "data" field instead of "content"
-            var payload = new JObject(parsed);
-            payload.Remove("content");
-            payload["data"] = rawData;
-
-            // Interceptor routing
-            if (!string.IsNullOrEmpty(interceptorName))
-            {
-                if (_interceptors.TryGetValue(interceptorName, out var interception))
+                // art_secure -> secure callback
+                if (channel == "art_secure")
                 {
+                    var key = $"secure-{refId}";
+                    Action<object> cb;
+                    lock (SecureCallbacks) { SecureCallbacks.TryGetValue(key, out cb); }
+                    if (cb != null)
+                    {
+                        JToken innerParsed = null;
+                        if (rawData != null)
+                        {
+                            try { innerParsed = JToken.Parse(rawData.ToString()); }
+                            catch { }
+                        }
+
+                        var result = new JObject
+                        {
+                            ["channel"] = channel,
+                            ["namespace"] = ns,
+                            ["data"] = innerParsed,
+                            ["ref_id"] = refId,
+                            ["event"] = evt
+                        };
+
+                        cb(result);
+                        lock (SecureCallbacks) { SecureCallbacks.Remove(key); }
+                    }
+                    return;
+                }
+
+                // Limit block: a frame without a channel carrying a limit code.
+                var code = parsed["code"]?.ToString();
+                if (string.IsNullOrEmpty(channel) &&
+                    (code == "CONNECTION_MINUTES_LIMIT_EXCEEDED" || code == "CONCURRENT_LIMIT_EXCEEDED"))
+                {
+                    var error = parsed["error"]?.ToString();
+                    Debug.LogError(
+                        $"[ART] {(code == "CONCURRENT_LIMIT_EXCEEDED" ? "Concurrent connection limit reached" : "Connection minutes limit exceeded")}. Reconnection blocked.");
+                    _emitter.Emit("limitExceeded", new JObject { ["code"] = code, ["error"] = error });
+                    FailConnection(new ConnectionError(
+                        string.IsNullOrEmpty(error) ? "Your connection limit has been reached." : error, code));
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(channel) || (string.IsNullOrEmpty(evt) && returnFlag != "SA"))
+                {
+                    Debug.LogWarning($"[ART] Received message without channel or event: {parsed}");
+                    return;
+                }
+
+                if (evt == "shift_to_http")
+                {
+                    SwitchToHttpPoll();
+                    return;
+                }
+
+                if (evt == "error")
+                {
+                    Debug.LogError($"[ART] Received error message: {parsed}");
+                }
+
+                // Build payload with "data" field instead of "content"
+                var payload = new JObject(parsed);
+                payload.Remove("content");
+                payload["data"] = rawData;
+
+                // Interceptor routing
+                if (!string.IsNullOrEmpty(interceptorName))
+                {
+                    Interceptor interception;
+                    lock (_stateLock) { _interceptors.TryGetValue(interceptorName, out interception); }
+
+                    if (interception != null)
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try { await interception.HandleMessage(channel, payload); }
+                            catch (Exception ex) { Debug.LogException(ex); }
+                        });
+                    }
+                    else
+                    {
+                        Debug.LogWarning($"[ART] No Interception found for channel: {channel}");
+                    }
+                    return;
+                }
+
+                // Subscription routing - key is "channel[:namespace]" like the JS socket. If nothing is
+                // registered under the namespaced key, fall back to the plain channel name.
+                var subKey = string.IsNullOrEmpty(ns) ? channel : $"{channel}:{ns}";
+
+                BaseSubscription sub = null;
+                lock (_stateLock)
+                {
+                    if (!_subscriptions.TryGetValue(subKey, out sub) && !string.IsNullOrEmpty(ns))
+                        _subscriptions.TryGetValue(channel, out sub);
+
+                    if (sub == null)
+                    {
+                        Debug.LogWarning($"[ART] No subscription found for channel: {subKey}, adding to buffer");
+                        if (!_pendingIncomingMessages.TryGetValue(subKey, out var arr))
+                        {
+                            arr = new List<(string, JObject)>();
+                            _pendingIncomingMessages[subKey] = arr;
+                        }
+                        arr.Add((evt, payload));
+                    }
+                }
+
+                if (sub != null)
+                {
+                    var target = sub;
                     _ = Task.Run(async () =>
                     {
-                        try { await interception.HandleMessage(channel, payload); }
+                        try { await target.HandleMessage(evt, payload); }
                         catch (Exception ex) { Debug.LogException(ex); }
                     });
                 }
-                else
-                {
-                }
-                return;
             }
-
-            // Subscription routing — keyed by plain channel name, exactly like the Kotlin
-            // socket (subscriptions[channel]); subscriptions are also stored by plain name,
-            // so including the namespace here would orphan namespaced frames in the buffer.
-            var subKey = channel;
-
-            if (_subscriptions.TryGetValue(subKey, out var sub))
+            catch (Exception ex)
             {
-                _ = Task.Run(async () =>
-                {
-                    try { await sub.HandleMessage(evt, payload); }
-                    catch (Exception ex) { Debug.LogException(ex); }
-                });
-            }
-            else
-            {
-                if (!_pendingIncomingMessages.ContainsKey(subKey))
-                    _pendingIncomingMessages[subKey] = new List<(string, JObject)>();
-                _pendingIncomingMessages[subKey].Add((evt, payload));
+                Debug.LogError($"[ART] Failed to handle incoming message: {ex.Message}");
             }
         }
 
         private void SwitchToHttpPoll()
         {
             if (_pullSource == "http") return;
+            Debug.Log("[ART] Shifting pullSource -> http, pushSource -> http");
             _pullSource = "http";
             _pushSource = "http";
             _lpClient.Start(_connection?.ConnectionId ?? "");
         }
 
-        // ---- IWebSocketHandler: SendMessage ----
+        // =====================================================================
+        // Sending
+        // =====================================================================
+
+        /// <summary>
+        /// Sends a message. Nothing is ever queued for silent replay after a reconnect: if the
+        /// connection is not usable this throws a <see cref="ConnectionError"/>.
+        /// </summary>
         public bool SendMessage(string message)
         {
-            if (_ws == null || _ws.State != WebSocketState.Open)
+            if (_connectionFailure != null) throw _connectionFailure;
+
+            if (_pushSource == "http")
             {
-                PendingSendMessages.Add(message);
-                return false;
-            } 
+                var connectionId = _connection?.ConnectionId;
+                if (string.IsNullOrEmpty(connectionId) || !IsConnectionActive)
+                    throw new ConnectionError("The connection is not ready. Please reconnect.", "CONNECTION_LOST");
 
-            var bytes = Encoding.UTF8.GetBytes(message);
+                var generation = CurrentGeneration;
+                // Dispatch once. A timeout does not establish whether execution happened,
+                // so never queue or replay the operation after reconnecting.
+                _ = SendViaHttp(message, connectionId, generation).ContinueWith(t =>
+                {
+                    if (!t.IsFaulted) return;
+                    var error = t.Exception.GetBaseException();
+                    if (generation != CurrentGeneration) return;
+                    FailConnection(error as ConnectionError ?? new ConnectionError(
+                        $"Could not send the request: {error.Message}", "CONNECTION_SEND_FAILED"));
+                });
+                return true;
+            }
 
-            _ = Task.Run(async () =>
+            var ws = _ws;
+            if (ws != null && ws.State == WebSocketState.Open)
             {
-                try
-                {
+                _ = SendOverWebSocket(ws, Encoding.UTF8.GetBytes(message));
+                return true;
+            }
 
-                    await _ws.SendAsync(new ArraySegment<byte>(bytes),
-                        WebSocketMessageType.Text, true, _wsCts?.Token ?? CancellationToken.None);
-                }
-                catch (Exception ex)
+            // Never queue an execution for silent replay after reconnection.
+            throw new ConnectionError(
+                "The connection was lost before the message could be sent. Please reconnect.", "CONNECTION_LOST");
+        }
+
+        // ClientWebSocket allows a single outstanding SendAsync, so sends are serialized.
+        private async Task SendOverWebSocket(ClientWebSocket ws, byte[] bytes)
+        {
+            await _sendLock.WaitAsync();
+            try
+            {
+                await ws.SendAsync(new ArraySegment<byte>(bytes),
+                    WebSocketMessageType.Text, true, _wsCts?.Token ?? CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _emitter.Emit("error", ex);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        private async Task SendViaHttp(string message, string connectionId, int generation)
+        {
+            var payload = JObject.Parse(message);
+            var auth = Auth.GetInstance(_credentials);
+            var accessToken = (await auth.Authenticate()).AccessToken;
+            if (generation != CurrentGeneration || connectionId != _connection?.ConnectionId) return;
+
+            payload["connection_id"] = connectionId;
+
+            using var request = new UnityWebRequest($"{ArtConstants.BASE_URL}/v1/push-message", "POST");
+            request.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(payload.ToString(Formatting.None)));
+            request.downloadHandler = new DownloadHandlerBuffer();
+            request.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+            request.SetRequestHeader("Content-Type", "application/json");
+            request.SetRequestHeader("X-Org", _credentials.OrgTitle);
+            request.SetRequestHeader("Environment", _credentials.Environment);
+            request.SetRequestHeader("ProjectKey", _credentials.ProjectKey);
+
+            var res = await SendRequest(request, _connectionTimeoutMs);
+
+            if (res.TimedOut)
+                throw new ConnectionError("The request timed out. Check its outcome before trying again.", "CONNECTION_TIMEOUT");
+            if (res.NetworkError)
+                throw new InvalidOperationException(res.Error ?? "network error");
+
+            if (res.Status < 200 || res.Status >= 300)
+            {
+                var body = TryParseObject(res.Text);
+                var msg = body?["error"]?.Type == JTokenType.String
+                    ? body["error"].ToString()
+                    : body?["message"]?.ToString();
+                var errorCode = body?["error_code"]?.ToString();
+                if (string.IsNullOrEmpty(errorCode)) errorCode = body?["code"]?.ToString();
+                if (string.IsNullOrEmpty(errorCode)) errorCode = "CONNECTION_SEND_FAILED";
+
+                throw new ConnectionError(
+                    string.IsNullOrEmpty(msg) ? $"Request failed (HTTP {res.Status})." : msg,
+                    errorCode,
+                    (int)res.Status);
+            }
+        }
+
+        // ---- UnityWebRequest helpers ----
+        private struct HttpResult
+        {
+            public long Status;
+            public string Text;
+            public string Error;
+            public bool TimedOut;
+            public bool NetworkError;
+        }
+
+        private static async Task<HttpResult> SendRequest(UnityWebRequest request, long timeoutMs)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var op = request.SendWebRequest();
+            while (!op.isDone)
+            {
+                if (sw.ElapsedMilliseconds > timeoutMs)
                 {
-                    _emitter.Emit("error", ex);
+                    request.Abort();
+                    return new HttpResult { TimedOut = true, Error = "timeout" };
                 }
-            });
-            return true;
+                await Task.Yield();
+            }
+
+            return new HttpResult
+            {
+                Status = request.responseCode,
+                Text = request.downloadHandler?.text,
+                Error = request.error,
+                NetworkError = request.result == UnityWebRequest.Result.ConnectionError
+            };
+        }
+
+        private static JObject TryParseObject(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            try { return JObject.Parse(text); }
+            catch { return null; }
         }
 
         public void SetAutoReconnect(bool flag) => _autoReconnect = flag;
 
-        // ---- CloseWebSocket ----
+        // =====================================================================
+        // Close / wait
+        // =====================================================================
+
         public async Task CloseWebSocket(bool clearConnection = false)
         {
-            await SafeClose();
             IsConnectionActive = false;
             _connection = null;
             _isConnecting = false;
-            _wsCts?.Cancel();
 
             if (clearConnection)
             {
-                _pendingIncomingMessages.Clear();
-                PendingSendMessages.Clear();
-                _subscriptions.Clear();
-                _interceptors.Clear();
+                lock (_stateLock)
+                {
+                    _pendingIncomingMessages.Clear();
+                    _subscriptions.Clear();
+                    _interceptors.Clear();
+                }
+                PendingSendMessages = new List<string>();
             }
 
             _heartbeatCts?.Cancel();
             _heartbeatCts = null;
+
+            await SafeClose();
+            _wsCts?.Cancel();
         }
 
-        // ---- IWebSocketHandler: Wait ----
-        public Task Wait()
+        /// <summary>
+        /// Completes when the connection is ready. Rejects on connection failure; after the
+        /// connection timeout without a connection it fails the connection (CONNECTION_TIMEOUT).
+        /// </summary>
+        public async Task WaitForConnection()
         {
-            if (IsConnectionActive) return Task.CompletedTask;
+            if (_connectionFailure != null) throw _connectionFailure;
+            if (IsConnectionActive) return;
 
-            var tcs = new TaskCompletionSource<bool>();
-            lock (_waiterLock)
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (_waiterLock) { _connectionWaiters.Add(tcs); }
+
+            var timerCts = new CancellationTokenSource();
+            _ = Task.Delay((int)Math.Min(_connectionTimeoutMs, int.MaxValue), timerCts.Token).ContinueWith(t =>
             {
-                _connectionWaiters.Add(tcs);
+                if (t.IsCanceled || tcs.Task.IsCompleted) return;
+                FailConnection(new ConnectionError(
+                    "Unable to establish a connection. Please check your connection and try again.",
+                    "CONNECTION_TIMEOUT"));
+            }, TaskContinuationOptions.ExecuteSynchronously);
+
+            try
+            {
+                await tcs.Task;
             }
-            return tcs.Task;
+            finally
+            {
+                timerCts.Cancel();
+                lock (_waiterLock) { _connectionWaiters.Remove(tcs); }
+            }
         }
+
+        // Kept for existing callers.
+        public Task Wait() => WaitForConnection();
 
         private void ResolveWaiters()
         {
@@ -604,88 +1092,123 @@ namespace ART.ADK
                 w.TrySetResult(true);
         }
 
-        // ---- Heartbeat ----
+        // =====================================================================
+        // Heartbeat
+        // =====================================================================
+
+        private JObject BuildHeartbeatPayload()
+        {
+            JObject[] subs;
+            lock (_stateLock)
+            {
+                subs = _subscriptions.Select(kv => new JObject
+                {
+                    ["name"] = kv.Key,
+                    ["presenceTracking"] = kv.Value.IsListening
+                }).ToArray();
+            }
+
+            return new JObject
+            {
+                ["connectionId"] = _connection?.ConnectionId,
+                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ["subscriptions"] = new JArray(subs)
+            };
+        }
+
         private void StartHeartbeat()
         {
-            if (_heartbeatCts != null) return;
-            _heartbeatCts = new CancellationTokenSource();
-            var ct = _heartbeatCts.Token;
+            if (_heartbeatCts != null) return; // prevent multiple timers
+
+            var cts = new CancellationTokenSource();
+            _heartbeatCts = cts;
+            var ct = cts.Token;
 
             _ = Task.Run(async () =>
             {
-                while (!ct.IsCancellationRequested)
+                try
                 {
-                    await Task.Delay(30000, ct);
-                    if (!IsConnectionActive) continue;
-
-                    var subs = _subscriptions.Select(kv => new JObject
+                    while (!ct.IsCancellationRequested)
                     {
-                        ["name"] = kv.Key,
-                        ["presenceTracking"] = kv.Value.IsListening
-                    }).ToArray();
+                        await Task.Delay(30000, ct);
+                        if (!IsConnectionActive) continue; // only when alive
 
-                    var payload = new JObject
-                    {
-                        ["connectionId"] = _connection?.ConnectionId,
-                        ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                        ["subscriptions"] = new JArray(subs)
-                    };
-
-                    try
-                    {
-                        await PushForSecureLine("heartbeat", payload, false);
+                        try { await PushForSecureLine("heartbeat", BuildHeartbeatPayload(), false); }
+                        catch { /* Lifecycle errors are delivered through connectionFailed. */ }
                     }
-                    catch { }
                 }
+                catch (OperationCanceledException) { }
             });
         }
 
-        // ---- IWebSocketHandler: Encrypt/Decrypt ----
+        // =====================================================================
+        // Encrypt / Decrypt
+        // =====================================================================
+
         public Task<string> Encrypt(string data, string recipientPublicKey)
             => EncryptFunc(data, recipientPublicKey);
 
         public Task<string> Decrypt(string encryptedHash, string senderPublicKey)
             => DecryptFunc(encryptedHash, senderPublicKey);
 
-        // ---- Receive loop ----
-        private async Task StartReceiveLoop()
+        // =====================================================================
+        // Receive loop
+        // =====================================================================
+
+        private async Task StartReceiveLoop(ClientWebSocket ws, CancellationToken token, int generation)
         {
             var buffer = new byte[8192];
 
             try
             {
-                while (_ws != null && _ws.State == WebSocketState.Open)
+                while (ws.State == WebSocketState.Open)
                 {
                     var sb = new StringBuilder();
                     WebSocketReceiveResult result;
 
                     do
                     {
-                        result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), _wsCts.Token);
+                        result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), token);
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
-                            IsConnectionActive = false;
-                            _isConnecting = false;
-                            _emitter.Emit("close", result.CloseStatusDescription);
+                            HandleSocketClosed(ws, generation, result.CloseStatusDescription);
                             return;
                         }
                         sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
                     } while (!result.EndOfMessage);
 
-                    var message = sb.ToString();
-                    ParseIncomingMessage(message);
+                    if (generation != CurrentGeneration) return;
+                    ParseIncomingMessage(sb.ToString());
                 }
+
+                HandleSocketClosed(ws, generation, "closed");
             }
             catch (Exception ex)
             {
-                IsConnectionActive = false;
-                _isConnecting = false;
-                _emitter.Emit("close", ex);
+                HandleSocketClosed(ws, generation, ex);
             }
         }
 
-        // ---- Event listeners ----
+        // Only the current socket of the current generation may report a close; a socket we
+        // detached/closed ourselves (reconnect, FailConnection, Disconnect) stays silent.
+        private void HandleSocketClosed(ClientWebSocket ws, int generation, object detail)
+        {
+            if (generation != CurrentGeneration || !ReferenceEquals(ws, _ws)) return;
+
+            IsConnectionActive = false;
+            _isConnecting = false;
+            Debug.Log($"[ART] Live closed: {detail}");
+            _emitter.Emit("close", detail);
+        }
+
+        // =====================================================================
+        // Event listeners
+        // =====================================================================
+
         public string On(string eventName, Action<object> handler) => _emitter.On(eventName, handler);
         public void Off(string eventName, string id) => _emitter.Off(eventName, id);
+
+        // IWebSocketHandler.SendMessage returns void; the public method above returns bool.
+        void IWebSocketHandler.SendMessage(string message) => SendMessage(message);
     }
 }

@@ -1,73 +1,91 @@
+using System;
 using System.Threading.Tasks;
 
 namespace ART.ADK
 {
     /// <summary>
-    /// Abstract base for client-side workflow handles (e.g. <see cref="Agent"/>,
-    /// <see cref="Orchestrator"/>) that own a single underlying <see cref="Subscription"/> to a
-    /// dedicated server-side channel. Concentrates the lazy-idempotent subscribe pattern in one
-    /// place: subclasses only override <see cref="ChannelName"/>. Mirrors
-    /// <c>js-adk-common/agentic/BaseWorkflow.ts</c>.
+    /// Shared base for workflow entities (Agent, Orchestrator, ...) that talk over a single
+    /// named channel. Subscription is lazy and idempotent: many callers share one in-flight
+    /// subscribe. Mirrors <c>agentic/channelEntity.ts</c> (BaseWorkflow).
     /// </summary>
     public abstract class BaseWorkflow
     {
-        /// <summary>Underlying socket used to (lazily) open the workflow's subscription.</summary>
         protected readonly Socket Socket;
 
-        /// <summary>Live subscription, populated once the lazy subscribe completes.</summary>
-        protected Subscription Subscription;
+        /// <summary>The resolved subscription (null until the first subscribe succeeds).</summary>
+        protected Subscription ActiveSubscription;
 
-        /// <summary>In-flight subscribe task used to coalesce concurrent callers.</summary>
+        /// <summary>The in-flight / completed subscribe task (null when not started or after a failure).</summary>
         protected Task<Subscription> SubscribePromise;
 
-        private readonly object _connectLock = new object();
+        private readonly object _subscribeLock = new object();
 
-        /// <summary>Creates a <see cref="BaseWorkflow"/> bound to <paramref name="socket"/>.</summary>
         protected BaseWorkflow(Socket socket)
         {
             Socket = socket;
         }
 
-        /// <summary>The dedicated server-side channel this workflow subscribes to.</summary>
+        /// <summary>The channel this workflow subscribes to (JS: abstract channelName()).</summary>
         protected abstract string ChannelName { get; }
 
         /// <summary>
-        /// Kicks off the (lazy) subscription to <see cref="ChannelName"/> if it has not started
-        /// yet, and returns <c>this</c> for chaining. Idempotent.
+        /// Starts the subscription if it hasn't started yet and returns this instance for chaining.
+        /// Idempotent. A failed subscribe clears the cached task so a later call can retry.
         /// </summary>
         public BaseWorkflow Connect()
         {
-            lock (_connectLock)
+            lock (_subscribeLock)
             {
-                if (SubscribePromise == null)
-                    SubscribePromise = SubscribeInternal();
+                if (SubscribePromise != null) return this;
+
+                var promise = SubscribeCore();
+                SubscribePromise = promise;
+
+                // JS: .catch(error => { this.subscribePromise = undefined; throw error; })
+                // Attached after assignment so a synchronous failure still clears it.
+                _ = promise.ContinueWith(t =>
+                {
+                    if (t.IsFaulted || t.IsCanceled)
+                    {
+                        lock (_subscribeLock)
+                        {
+                            if (ReferenceEquals(SubscribePromise, promise))
+                                SubscribePromise = null;
+                        }
+                        var _ = t.Exception; // observe so it isn't reported as unobserved
+                    }
+                }, TaskContinuationOptions.ExecuteSynchronously);
             }
             return this;
         }
 
-        private async Task<Subscription> SubscribeInternal()
+        private async Task<Subscription> SubscribeCore()
         {
             var sub = await Socket.Subscribe(ChannelName);
-            Subscription = sub as Subscription;
-            return Subscription;
+            var typed = sub as Subscription
+                ?? throw new InvalidOperationException(
+                    $"Channel '{ChannelName}' did not produce a Subscription (got {sub?.GetType().Name ?? "null"}).");
+            ActiveSubscription = typed;
+            return typed;
         }
 
         /// <summary>
-        /// Returns the active <see cref="Subscription"/>, kicking off the subscribe call if
-        /// <see cref="Connect"/> has not yet been invoked. Used by <see cref="AgentThread"/> /
-        /// <see cref="Orchestrator.Thread"/>.
+        /// Waits for the socket, then returns the subscription, starting it if needed.
+        /// (JS: <c>_getSubscription()</c>, marked @internal.)
         /// </summary>
-        public Task<Subscription> GetSubscription()
+        internal async Task<Subscription> GetSubscription()
         {
-            if (Subscription != null) return Task.FromResult(Subscription);
+            await Socket.WaitForConnection();
+
+            if (ActiveSubscription != null) return ActiveSubscription;
+
             Task<Subscription> promise;
-            lock (_connectLock)
+            lock (_subscribeLock)
             {
-                if (SubscribePromise == null)
-                    SubscribePromise = SubscribeInternal();
+                if (SubscribePromise == null) Connect();
                 promise = SubscribePromise;
             }
-            return promise;
+            return await promise;
         }
     }
 }
