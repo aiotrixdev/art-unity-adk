@@ -25,7 +25,10 @@ namespace ART.ADK
         {
             try
             {
-                _stopPresence = await _subscription.FetchPresence(unique, onPresenceChanged);
+              //  _stopPresence = await _subscription.FetchPresence(unique, onPresenceChanged);
+               await _subscription.FetchPresence(
+            onPresenceChanged,
+            new PresenceConfig { Unique = unique });
             }
             catch (Exception ex)
             {

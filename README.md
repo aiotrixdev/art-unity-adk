@@ -1,9 +1,49 @@
 # ART - A Realtime Tech communication (Unity ADK)
 
-A powerful, real-time Unity C# library for building highly collaborative, secure, and agentic applications. **ART ADK** provides a robust set of tools for WebSocket management, Conflict-free Replicated Data Types (CRDTs) for multi-user state synchronization, end-to-end encrypted messaging, and AI agentic workflows (incorporating single Agents and Orchestrators).
+The ART Unity ADK connects Unity apps to ART (A Realtime Tech), a realtime communication platform for building intelligent applications with WebSocket-based messaging, AI Agents, AI Orchestrators, presence tracking, end-to-end encrypted channels, and CRDT-backed shared objects.
 
+With the ADK you can:
+
+- Send and receive messages in real time
+- See who is online in a channel
+- Encrypt conversations end-to-end
+- Keep shared data in sync across users and devices
+- Check or block messages before they are delivered
+- Chat with AI agents and run multi-agent workflows
+- Upload files and share them with AI agents
+- Receive in-app notifications  
+
+## Contents
+
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Getting started](#getting-started)
+- [Connection](#connection)
+- [Channels and messages](#channels-and-messages)
+- [Presence](#presence)
+- [Encrypted channels](#encrypted-channels)
+- [Shared objects](#shared-objects)
+- [Interceptors](#interceptors)
+- [AI agents](#ai-agents)
+- [AI orchestrators](#ai-orchestrators)
+- [File storage](#file-storage)
+- [Profiles and connectors](#profiles-and-connectors)
+- [Notifications](#notifications)
+- [Calling ART APIs](#calling-art-apis)
+- [Errors](#errors)
+- [Logging](#logging)
+- [API reference](#api-reference)
+- [Platform and runtime notes](#platform-and-runtime-notes)
+- [Documentation](#documentation)
+- [License](#license)
 ---
 
+
+## Requirements
+
+- A Unity version supported by the package (see the `unity` field in the package's `package.json`)
+- An ART project with its environment, project key, organisation and client ID
+ 
 ## Installation
 
 ### 1. Via Unity Package Manager (UPM)
@@ -30,10 +70,22 @@ Clone or copy the `com.arealtimetech.adk` package folder directly into your proj
 
 ---
 
-## Configuration
+## Getting started
 
-### 1. Initialization
-Configure the core ADK client with your environment credentials:
+### 1. Get a user passcode
+
+ART signs users in with a short-lived passcode. Request it from ART with your client credentials and pass only the passcode to the connection. In the example app:
+
+```csharp
+string passcode = await AuthService.ConnectWithPasscode(
+    username, username, username,
+    credentials, $"https://{serverUri}");
+```
+
+> **Important:** Anything shipped inside a build can be extracted. Don't embed your client secret in a released app. Request the passcode from your own backend and return only the passcode to the app. Whether users can sign in using only a passcode depends on your ART project settings, so confirm this with the ART team before release.
+
+
+### 2. Create credentials and connect
 
 ```csharp
 using ART.ADK;
@@ -54,10 +106,52 @@ var adkConfig = new AdkConfig
 };
 
 var adk = new Adk(adkConfig);
+await adk.Connect();
 ```
 
-### 2. Generate Client Credentials
-Create a configuration JSON file containing your client credentials from the [ART Live Dashboard](https://dev.arealtimetech.com). Save it under the path configured in `ArtConstants.CONFIG_JSON_PATH` (default is `config.json`):
+### 3. Send and receive a message
+
+```csharp
+using Newtonsoft.Json.Linq;
+
+BaseSubscription channel = await adk.Subscribe("CHANNEL_NAME");
+
+channel.Emitter.On("message", (object data) =>
+{
+    Debug.Log($"Received: {data}");
+});
+
+await channel.Push("message", new JObject { ["text"] = "Hello ART!" });
+
+```
+
+
+### Other ways to provide credentials
+
+`GetCredentials` in `AdkConfig` is the simplest option. You can also set credentials directly or load them from a JSON file.
+
+| **Option** | **When to use it** |
+|---|---|
+| `AdkConfig.GetCredentials` | Your credentials change over time, for example when the passcode is refreshed. The ADK calls it each time it signs in. |
+| `adk.SetCredentials(...)` | You already have a `CredentialStore` in hand. |
+| `adk.LoadConfig()` | You keep credentials in a `config.json` file. |
+
+**Set credentials directly**
+
+```csharp
+adk.SetCredentials(new CredentialStore
+{
+    Environment = "YOUR_ENV",
+    ProjectKey  = "YOUR_PROJECT_KEY",
+    OrgTitle    = "YOUR_ORG",
+    ClientID    = "YOUR_CLIENT_ID",
+    AccessToken = passcode
+});
+```
+
+**Load credentials from a JSON file**
+
+Create a configuration file from the [ART Live Dashboard](https://dev.arealtimetech.com) and save it at the path set in `ArtConstants.CONFIG_JSON_PATH` (default `config.json`):
 
 ```json
 {
@@ -69,30 +163,19 @@ Create a configuration JSON file containing your client credentials from the [AR
 }
 ```
 
-### 3. Load Credentials at Runtime
-You can load the configuration file asynchronously using `adk.LoadConfig()`:
+Then load it at runtime:
 
 ```csharp
 CredentialStore credentials = await adk.LoadConfig();
 adk.SetCredentials(credentials);
 ```
 
-### 4. Authenticate & Obtain a Passcode
-Generate an authentication passcode before connecting. In the example app:
+> Use a `ClientSecret` only in development or on a trusted server. See the note in [Get a user passcode](#1-get-a-user-passcode).
 
-```csharp
-string passcode = await AuthService.ConnectWithPasscode(
-    username, username, username,
-    credentials, $"https://{serverUri}");
-```
 
----
+## Connection
 
-## Quick Start
-
-### Connecting & Managing Lifecycle
-
-Use asynchronous methods (`async/await`) to manage the WebSocket connections:
+`Connect()` opens the WebSocket connection, signs the user in, and returns once ART has accepted the connection. Wire the connection events before you connect:
 
 ```csharp
 using System;
@@ -161,64 +244,90 @@ public class AdkConnectionManager : MonoBehaviour
 }
 ```
 
-### User Presence
+| **Event** | **Raised when** |
+|---|---|
+| `OnConnected` | The connection is open and signed in. Carries a `ConnectionDetail`. |
+| `OnClosed` | The connection closed |
+| `OnError` | The connection reported an error |
 
-Track presence changes using the `PresenceManager` or directly from your subscriptions:
+<!-- The rest of this section is inferred from the Swift ADK. Verify names and behaviour against the Unity API before publishing. -->
+
+`Connect()` throws a `ConnectionException` when it can't connect: `AUTHENTICATION_FAILED` when the credentials are missing or ART rejects them, or `CONNECTION_TIMEOUT` when the connection isn't ready in time. Calls made while a connection attempt is in progress share it.
+
+By default the ADK waits up to 30 seconds for the connection, for a sign-in request and for ART's reply to a request such as a subscribe. To change this, set `ConnectionTimeoutMs` to a positive number. It doesn't limit how long an agent can take to answer.
+
 
 ```csharp
-// Fetch and track active users on a subscription
-var unsubscribePresence = await subscription.FetchPresence(
-    unique: true,
-    callback: (List<string> users) =>
-    {
-        Debug.Log($"Presence received. Active users: {users.Count}");
-        foreach (var user in users)
-        {
-            Debug.Log($"User online: {user}");
-        }
-    }
-);
-
-// Call the returned action to stop tracking presence later
-unsubscribePresence();
+var adk = new Adk(new AdkConfig { Uri = "YOUR_WEBSOCKET_URI", ConnectionTimeoutMs = 15000 });
 ```
 
-### Subscribing to a Channel
-
-`adk.Subscribe` returns a `BaseSubscription`. For standard channels, cast it to `Subscription`. For shared-object CRDT channels, cast it to `SharedObjectChannel`.
+You can pause the connection and resume it later. A paused connection stays closed until you call `Resume()`.
 
 ```csharp
-// Subscribe to a namespaced channel
-BaseSubscription sub = await adk.Subscribe("live-cursor-channel");
+adk.Pause();
+await adk.Resume();
 
-if (sub is Subscription standardSub)
+await adk.Disconnect();   // close the connection
+```
+
+### When the connection fails
+
+Sometimes the connection can't continue: the credentials were rejected, a limit was reached, you paused or closed the connection, or it couldn't be restored after five attempts. The ADK then raises `OnConnectionFailed` with a `ConnectionException` and stops reconnecting. Agent runs in progress end with an error, and later sends and subscribes throw the same `ConnectionException` until you call `Connect()` again.
+
+```csharp
+adk.OnConnectionFailed += (ConnectionException error) =>
 {
-    // Listen to cursor-move events
-    standardSub.Bind("cursor-move", (object payload) =>
-    {
-        // Handle cursor position updates (payload as JObject/JToken)
-    });
-}
+    Debug.LogError($"Connection failed: {error.Code} {error.Message}");
+};
+
+adk.OnAuthenticationFailed += (AuthenticationFailedDetail detail) =>
+{
+    // Update the credentials, then call Connect() again.
+    Debug.LogError($"Sign-in rejected: {detail.Status} {detail.Error}");
+};
 ```
 
-Unsubscribe when you no longer need the channel:
+| **Code** | **Meaning** |
+|---|---|
+| `AUTHENTICATION_FAILED` | The credentials are missing or were rejected. `Status` holds the HTTP status when ART rejected them. |
+| `CONNECTION_TIMEOUT` | The connection, or ART's reply to a request, didn't arrive in time |
+| `CONNECTION_LOST` | The connection dropped before a message could be sent, or couldn't be restored |
+| `CONNECTION_PAUSED`, `CONNECTION_CLOSED` | You called `Pause()` or `Disconnect()` |
+| `CONNECTION_CANCELLED` | A newer connection attempt replaced this one |
+| `CONNECTION_AUTHORIZATION_FAILED` | The connection's sign-in couldn't be renewed |
+| `ACK_TIMEOUT` | ART didn't confirm a message |
+| `CONNECTION_MINUTES_LIMIT_EXCEEDED`, `CONCURRENT_LIMIT_EXCEEDED` | Your project reached its billing or concurrency limit |
+
+`adk.State` tells you where the connection stands:
+
+| **State** | **Meaning** |
+|---|---|
+| `AdkState.Connecting` | Opening the connection, or reconnecting after it dropped |
+| `AdkState.Connected` | Connected and signed in |
+| `AdkState.Paused` | Paused with `Pause()` |
+| `AdkState.Stopped` | Not connected |
+
+If your project reaches its billing or concurrency limit, the ADK also raises `OnLimitExceeded`.
+
+
+## Channels and messages
+
+A channel is a named stream of messages. Subscribe to a channel to send and receive messages on it. `Subscribe` returns a `BaseSubscription`: cast it to `Subscription` for regular channels, or to `SharedObjectChannel` for [shared-object channels](#shared-objects).
 
 ```csharp
+BaseSubscription sub = await adk.Subscribe("room-42");
+
+// When you no longer need the channel:
 await sub.Unsubscribe();
 ```
 
-### Pushing Messages
-
-Push events to a channel with payload data:
+### Sending messages
 
 ```csharp
-using Newtonsoft.Json.Linq;
-
-// Push a text message
 await sub.Push("message", new JObject { ["text"] = "Hello" });
 ```
 
-Target a specific user (required for secure and targeted channels — exactly one recipient):
+To send a message to a specific user, pass their username in `PushOptions`. Secure and targeted channels require exactly one recipient; targeting zero or more than one throws an exception.
 
 ```csharp
 await sub.Push(
@@ -228,11 +337,15 @@ await sub.Push(
 );
 ```
 
-*Note: Attempting to target zero or more than one recipient on secure or targeted channels will throw an exception.*
+<!-- Inferred from the Swift ADK. Verify against the Unity API before publishing. -->
 
-### Receiving Messages
+On targeted and encrypted channels, `Push` waits until ART confirms delivery. If no confirmation arrives within 50 seconds, it throws a `ConnectionException` with the code `ACK_TIMEOUT`.
 
-Bind to a specific event on the subscription's emitter:
+The ADK never queues a message to send later. If there's no connection, `Push` throws a `ConnectionException` and the message isn't sent. A message is never resent automatically, so after an error, check whether it took effect before you send it again.
+
+### Receiving messages
+
+Listen for one event on the subscription's emitter:
 
 ```csharp
 sub.Emitter.On("message", (object data) =>
@@ -241,36 +354,73 @@ sub.Emitter.On("message", (object data) =>
 });
 ```
 
-Or, on standard channels, listen to every event:
+On regular channels you can also bind to an event, listen to every event, and remove a listener:
 
 ```csharp
 if (sub is Subscription standardSub)
 {
+    // One event
+    standardSub.Bind("cursor-move", (object payload) =>
+    {
+        // payload is a JObject / JToken
+    });
+
+    // Every event
     standardSub.Listen((JObject data) =>
     {
         Debug.Log($"Event: {data["event"]} | Content: {data["content"]}");
     });
+
+    // Remove a listener
+    standardSub.Remove("cursor-move");
 }
 ```
 
-Unbind a specific listener:
+## Presence
+
+Find out who is online in a channel. The callback runs again whenever someone joins or leaves.
 
 ```csharp
-if (sub is Subscription standardSub)
-{
-    standardSub.Remove("message");
-}
+var stopPresence = await sub.FetchPresence(
+    unique: true,
+    callback: (List<string> users) =>
+    {
+        Debug.Log($"Online: {users.Count}");
+        foreach (var user in users) Debug.Log($"User online: {user}");
+    }
+);
+
+// Later, to stop receiving updates:
+stopPresence();
 ```
 
-### Encrypted Channels
+## Encrypted channels
 
-You can automatically generate key pairs and encrypt payloads directly over the wire using the internal encryption engine:
+Messages on encrypted channels are encrypted on the sender's device, and only the recipients can read them. Before using an encrypted channel, create a key pair for the current user. `GenerateKeyPair()` creates the keys and saves the public key on the server.
 
 ```csharp
-// Generate an asymmetric key-pair internally and save the public key on the server
 KeyPairType myKeyPair = await adk.GenerateKeyPair();
 
-// Encrypt and push secure data
+BaseSubscription secure = await adk.Subscribe("YOUR_SECURE_CHANNEL");
+
+if (secure is Subscription secureSub)
+{
+    secureSub.Emitter.On("message", (object data) =>
+    {
+        Debug.Log($"Decrypted message: {data}");
+    });
+
+    await secureSub.Push(
+        eventName: "message",
+        data: new JObject { ["text"] = "This is private" },
+        options: new PushOptions("bob") // exactly one recipient
+    );
+}
+```
+
+You can also push directly over the secure line:
+
+```csharp
 object response = await adk.PushForSecureLine(
     eventName: "CONFIDENTIAL_UPDATE",
     data: "My secret message",
@@ -278,218 +428,251 @@ object response = await adk.PushForSecureLine(
 );
 ```
 
-Then push to a secure channel. Encryption and decryption occur transparently:
+## Shared objects
 
-```csharp
-BaseSubscription secure = await adk.Subscribe("YOUR_SECURE_CHANNEL");
-
-if (secure is Subscription secureSub)
-{
-    await secureSub.Push(
-        eventName: "message",
-        data: new JObject { ["text"] = "This is private" },
-        options: new PushOptions("bob") // Secure channels require exactly one recipient
-    );
-
-    secureSub.Emitter.On("message", (object data) =>
-    {
-        Debug.Log($"Decrypted message: {data}");
-    });
-}
-```
-
----
-
-## Shared Object Channels (CRDT)
-
-Shared-object channels expose a JSON-like document that every subscriber edits concurrently; conflicts are resolved automatically via the SDK's CRDT engine.
+A shared-object channel holds a document that every subscriber can read and edit. Changes are merged automatically using CRDTs (conflict-free replicated data types), so everyone ends up with the same data.
 
 ```csharp
 BaseSubscription sub = await adk.Subscribe("YOUR_CRDT_CHANNEL");
 
-if (sub is SharedObjectChannel sharedSub)
+if (sub is SharedObjectChannel shared)
 {
-    CRDTEngine crdt = sharedSub.Crdt;
-    CRDTProxy state = sharedSub.State();
+    CRDTProxy state = shared.State();
 
-    // 1. Write
+    // Edit the document, then send your changes.
     state["document"].Set("My Doc");
-    await sharedSub.Flush();
+    await shared.Flush();
 
-    // 2. Read once
-    var query = sharedSub.Query("document");
+    // Read a value.
+    var query = shared.Query("document");
     object snapshot = await query.execute();
     Debug.Log($"Snapshot: {snapshot}");
 
-    // 3. Observe updates
-    Action dispose = query.listen(data =>
+    // Watch for changes.
+    Action stopWatching = query.listen(data =>
     {
         Debug.Log($"Document updated: {data}");
     });
 
-    // Call dispose() when done observing
-    dispose();
+    // Later:
+    stopWatching();
 }
 ```
 
-### Array Operations
+Lists support the usual operations:
 
 ```csharp
-CRDTProxy items = sharedSub.State()["items"];
+CRDTProxy items = shared.State()["items"];
 
-// Write operations
-items.Push("alpha");                  // Append
-items.Unshift("zero");                // Prepend
-object popped = items.Pop();          // Remove last and return value
-object removed = items.RemoveAt(2);   // Remove by index and return value
+items.Push("alpha");                  // add to the end
+items.Unshift("zero");                // add to the start
+object popped = items.Pop();          // remove the last item
+object removed = items.RemoveAt(2);   // remove the item at an index
 
-// Sync changes
-await sharedSub.Flush();
+await shared.Flush();
 
 Debug.Log($"Length: {items.Length}");
 ```
 
----
+<!-- Swift also offers items.splice(start:deleteCount:insert:). If the Unity CRDTProxy has an equivalent, add it here. -->
 
 ## Interceptors
 
-Register middleware-style interceptors for request/response message processing before they are dispatched:
+An interceptor sees messages before they are delivered and decides what happens to each one. Call `resolve` to deliver the message, with or without changes, or `reject` to block it.
 
 ```csharp
 await adk.Intercept("my-interceptor", (JObject request, Action<object> resolve, Action<string> reject) =>
 {
-    Debug.Log($"Intercepted message: {request}");
-    
-    // Resolve to pass through, or Reject to cancel
+    if (request["text"]?.ToString().Contains("badword") == true)
+    {
+        reject("Message blocked");
+        return;
+    }
     resolve(request);
 });
 ```
 
----
+The name must match an interceptor set up in your ART project.
 
-## Agents
 
-Agents let you drive a single conversational AI agent over its own real-time channel (`agent_com_<agentId>`). Each agent exposes threads; a thread runs one logical conversation at a time and streams typed events, terminal responses, and human-in-the-loop (HITL) feedback.
+## AI agents
 
-*Note: Connect and authenticate the ADK client first. Agents and Orchestrators run on top of an active `Adk` session.*
+Chat with an agent built on ART. Each agent has its own channel (`agent_com_<agentId>`), and each conversation takes place in a thread.
 
-### Connect an Agent
+> Connect the `Adk` first. Agents and orchestrators run on top of an active session.
 
-```csharp
-// Opens the agent_com_<agentId> subscription
-Agent agent = adk.Agent("agent-id").Connect();
-
-// Open a conversation thread (each thread has a unique ThreadId)
-AgentThread thread = agent.Thread();
-```
-
-### Run a Prompt
-
-`thread.Run(...)` starts a run and returns a `Run` handle. `run.Done()` yields until the agent emits its terminal `agent_output` event, or throws `AgentRunException` on `agent_error` or transport failure.
+### Start a conversation
 
 ```csharp
+Agent agent = adk.Agent("your-agent-id").Connect();
+AgentThread thread = agent.Thread();   // each thread has a unique ThreadId
+
+await thread.Listen((AgentEventEnvelope envelope) =>
+{
+    Debug.Log($"Event: {envelope.Event}");
+});
+
 try
 {
-    Run run = await thread.Run("Summarise my last invoice");
-    AgentOutput output = await run.Done(); // Suspends until final response
-    Debug.Log($"Agent Reply: {output.Message}");
+    Run run = await thread.Run("Plan a 3-day trip to Dubai");
+    AgentOutput output = await run.Done();   // waits for the agent's final answer
+    Debug.Log($"Agent reply: {output.Message}");
 }
 catch (AgentRunException e)
 {
-    Debug.LogError($"Agent failed: {e.Message} (Code: {e.Error.Code})");
+    Debug.LogError($"The agent couldn't finish: {e.Message} (Code: {e.Error.Code})");
 }
 ```
 
-### Listen to Streamed Events
+`run.Done()` waits for the agent's terminal `agent_output` event, and throws `AgentRunException` on `agent_error` or a transport failure. `Listen` receives every event in the thread as it happens, such as progress updates and questions from the agent. `envelope.Content` holds the fields the server sent with the event.
 
-Register one or more `Listen` callbacks to receive every typed event on the thread. The callback receives an `AgentEventEnvelope` object.
+An agent ID is the agent's slug, such as `travel-agent`. To use a specific build, add its name: `travel-agent@release2`.
+
+<!-- Inferred from the Swift ADK. Verify against the Unity API before publishing. -->
+
+`Listen`, `ListenState` and `Run` subscribe to the agent's channel when needed, and throw if that fails, for example when the signed-in user has no access to the agent.
+
+If the connection fails during a run, the run ends with an `AgentRunException` that has the connection error's code, and `Error.Details["source"]` is `"connection"`. The agent may still finish on the server, but the app can't receive the answer, so check the result before you run the request again. The thread's state becomes `failed` with the message "Connection unavailable".
+
+When you no longer need a thread, call `thread.Dispose()`. It ends the thread's run and removes the thread's listeners, while other threads of the agent keep working. After `Dispose()`, `Run`, `Listen` and `ListenState` throw an error.
+
+Runs started from the ART playground can say so with `thread.Run(input, executionOrigin: ExecutionOrigin.Playground)`.
+
+### Listen to events
+
+Handle each event type in the thread:
 
 ```csharp
 await thread.Listen((AgentEventEnvelope envelope) =>
 {
     switch (envelope.Event)
     {
-        // Terminal success
-        case "agent_output":
+        case "agent_output":        // final answer
             var output = envelope.Content as AgentOutput;
-            Debug.Log($"Final Output: {output.Message}");
+            Debug.Log($"Final output: {output.Message}");
             break;
 
-        // Terminal failure
-        case "agent_error":
+        case "agent_error":         // the run failed
             var error = envelope.Content as AgentError;
-            Debug.LogError($"Agent Error: {error.Message}");
+            Debug.LogError($"Agent error: {error.Message}");
             break;
 
-        // Mid-run prompt for the user (Human-in-the-loop request)
-        case "human_input_request":
+        case "human_input_request": // the agent is asking the user for input
             var hitl = envelope.Content as HumanInputRequest;
             Debug.Log($"Needs input: {hitl.Prompt}");
             break;
 
-        // Waiting on another agent
-        case "agent_wait":
+        case "agent_wait":          // waiting on another agent
             var wait = envelope.Content as AgentWait;
             Debug.Log($"Waiting: {wait.Reason}");
             break;
 
-        // Planner re-plan
-        case "planner_correction":
+        case "planner_correction":  // the planner re-planned
             var correction = envelope.Content as PlannerCorrection;
             Debug.Log($"Correction: {correction.Reason}");
             break;
 
-        // Unknown events arrive as UnknownAgentEvent
-        default:
+        default:                    // unknown events arrive as UnknownAgentEvent
             Debug.Log($"Event {envelope.Event}: {envelope.Content}");
             break;
     }
 });
 ```
 
----
+### Display progress
 
-## Orchestrator
+<!-- Inferred from the Swift ADK. Verify against the Unity API before publishing. -->
 
-Orchestrators coordinate multi-agent workflows over a dedicated channel (`orch_com_<orchestratorId>`). An orchestrator thread is a lightweight, event-driven channel you push into and listen on directly—ideal for fan-out / fan-in flows and HITL prompts routed through a coordinator.
-
-### Connect and Open a Thread
+Use the thread's state to drive a status indicator, such as "Queued" or "Waiting for your input":
 
 ```csharp
-// Opens the orch_com_<orchestratorId> subscription
-Orchestrator orchestrator = adk.Orchestrator("workflow-1").Connect();
+Action stopUpdates = await thread.ListenState((AgentThreadState state) =>
+{
+    Debug.Log($"{state.Phase} {state.Message}");
+});
 
-// Start or resume a thread (pass an optional threadId to resume)
+Debug.Log(thread.GetState().Phase);   // the latest state
+stopUpdates();                        // stop receiving updates
+```
+
+The phase is one of `idle`, `submitted`, `queued`, `running`, `waitingForAgent`, `waitingForApproval`, `waitingForWorkspace`, `completed`, `failed` or `cancelled`.
+
+### Answer questions from the agent
+
+<!-- Inferred from the Swift ADK. Verify against the Unity API before publishing. -->
+
+An agent can pause and ask the user for more information. This is often called human-in-the-loop. Register a handler before you start the run, and send the answer with `SendFeedback`:
+
+```csharp
+thread.FeedbackRequest(async (HumanInputRequest request, Run run) =>
+{
+    Debug.Log($"The agent asks: {request.Prompt}");
+
+    try
+    {
+        await run.SendFeedback("Budget is 50,000, travelling in December");
+    }
+    catch (Exception e)
+    {
+        Debug.LogError($"Couldn't send the answer: {e.Message}");
+    }
+});
+```
+
+### Share files with an agent
+
+<!-- Inferred from the Swift ADK. Verify against the Unity API before publishing. -->
+
+Upload the file to the thread first, then attach it to your message:
+
+```csharp
+FileRef file = await thread.Upload(fileBytes, new UploadOptions
+{
+    Filename = "report.pdf",
+    ContentType = "application/pdf",
+    OnProgress = fraction => Debug.Log($"Uploaded {(int)(fraction * 100)}%")
+});
+
+Run run = await thread.Run("Summarize this document", fileMeta: new[] { new MediaRef(file) });
+```
+
+The file belongs to the thread and is owned by the agent. `thread.ListFiles()` lists the thread's files.
+
+## AI orchestrators
+
+An orchestrator coordinates several agents to complete a larger task. It runs on a dedicated channel (`orch_com_<orchestratorId>`), and a thread is an event-driven channel that you push into and listen on directly.
+
+### Start a thread
+
+```csharp
+Orchestrator orchestrator = adk.Orchestrator("your-orchestrator-id").Connect();
+
+// Start a new thread, or pass a thread id to resume one.
 OrchestratorThread thread = await orchestrator.Thread("optional-thread-id");
 Debug.Log($"Thread ID: {thread.GetId()}");
 ```
 
-### Push and Receive
+### Listen and send input
 
 ```csharp
-// Stream every event on this thread
+// Every event on this thread
 thread.Listen((object envelope) =>
 {
     if (envelope is ThreadEventEnvelope env)
-    {
         Debug.Log($"Thread event: {env.Event} | Content: {env.Content}");
-    }
 });
 
-// Or bind to a single event type
-thread.Bind("agent_output", (object data) =>
-{
-    Debug.Log($"Output: {data}");
-});
+// Or one event type
+thread.Bind("agent_output", (object data) => Debug.Log($"Output: {data}"));
 
-// Kick off the workflow
+// Send the user's input
 await thread.Push(
     eventName: "user_input",
-    data: new JObject { ["user_input"] = "Plan my week" }
+    data: new JObject { ["user_input"] = "Plan a 3-day trip to Goa" }
 );
 ```
 
-Target specific recipients with `PushConfig`:
+To send to specific recipients, use `PushConfig`:
 
 ```csharp
 await thread.Push(
@@ -499,71 +682,254 @@ await thread.Push(
 );
 ```
 
-### Human-in-the-loop (HITL) Replies
-In an orchestrator thread, human-feedback requests are delivered with an SDK-injected `Reply` callback on the `ThreadEventEnvelope`. To answer the prompt, call `env.Reply`:
+### Show thread progress
+
+<!-- Inferred from the Swift ADK. Verify against the Unity API before publishing. -->
+
+```csharp
+thread.ListenState((OrchestratorThreadState state) =>
+{
+    Debug.Log(state.Phase);
+});
+```
+
+If the connection fails while a request is in progress, `Listen` receives an `agent_error` event whose details have `source: connection`, and the thread's state becomes `failed`. Call `thread.Dispose()` when you no longer need the thread.
+
+### Answer questions from the orchestrator
+
+Human-feedback requests arrive with an SDK-injected `Reply` callback on the `ThreadEventEnvelope`. Call it to answer:
 
 ```csharp
 thread.Listen((object raw) =>
 {
     if (raw is ThreadEventEnvelope env && env.IsHumanFeedbackRequest)
     {
-        Debug.Log($"HITL requested: {env.Content}");
-        
-        // Respond to the request
+        Debug.Log($"Input requested: {env.Content}");
         env.Reply(new JObject { ["message"] = "Yes, proceed." });
     }
 });
 ```
 
-### Clean Up
+### Clean up
 
 ```csharp
-// Remove a single listener
-thread.Remove("agent_output");
-
-// Tear down the thread and detach all listeners
-thread.Dispose();
+thread.Remove("agent_output");   // remove one listener
+thread.Dispose();                // end the thread and detach all listeners
 ```
 
----
+## File storage
 
-## API Reference
+Files are temporary media that belong to a conversation thread. Upload a file, then list, fetch or delete it. `Storage` uses the authenticated ADK session: it requests a signed URL, uploads the bytes, then confirms the upload. Create the client only after you have set credentials and connected the ADK.
 
-| Class/Type | Purpose |
-| :--- | :--- |
-| **Adk** | Top-level facade — connect, disconnect, subscribe, intercept, key management |
-| **AdkConfig** | Connection configuration (URI, credentials, auth token) |
-| **CredentialStore** | Immutable holder for org / project / client credentials |
-| **BaseSubscription** | Base type for all channel subscriptions (push, fetchPresence, unsubscribe) |
-| **Subscription** | Default / secure / targeted / group channel — Listen(), Bind(), emitter.on() |
-| **SharedObjectChannel** | CRDT-backed shared-object channel — State(), Query(), Flush() |
-| **CRDTEngine** | Underlying conflict-free replicated data engine |
-| **CRDTProxy** | Indexer-based path accessor for reading / mutating CRDT state |
-| **PushOptions** | Push options — `To`, `FromUsername`, `ThreadId` for targeted/secure channels |
-| **PushConfig** | Thread-scoped push options — `To`, `ThreadID`, `TimeoutMs` |
-| **KeyPairType** | KeyPair container (public/private key) for secure channels |
-| **ConnectionDetail** | Emitted on 'connection' — contains connectionId, instanceId, tenant info |
-| **Agent** | Agent handle bound to `agent_com_<agentId>` — Connect(), Thread() |
-| **AgentThread** | Thread handle for agent — Run(), Listen(), OnHumanInput() |
-| **Run** | Representation of an active conversation task — Done(), SendFeedback() |
-| **Orchestrator** | Orchestrator handle bound to `orch_com_<orchestratorId>` — Connect(), Thread() |
-| **OrchestratorThread** | Thread channel — Push(), Listen(), Bind(), Remove(), Dispose(), GetId() |
+```csharp
+using ART.ADK;
+using UnityEngine;
 
----
+var storage = new Storage();
 
-## Platform & Runtime Notes
+var uploaded = await storage.Upload(fileBytes, new UploadOptions
+{
+    Filename = "concept.png",
+    ContentType = "image/png",
+    OnProgress = value => Debug.Log($"Upload: {value:P0}")
+});
 
-### WebGL Compatibility
-- **Desktop/Mobile**: Native WebSocket support via C# `System.Net.WebSockets`.
-- **WebGL**: `System.Net.WebSockets` is **not** supported natively in WebGL builds. A custom JavaScript WebSocket bridge plugin is required for browser execution.
+Debug.Log($"Uploaded {uploaded.Name}: {uploaded.FileId}");
+Debug.Log(uploaded.ReadUrl);
 
-### Thread Safety & MainThreadDispatcher
-Unity is fundamentally single-threaded for engine API calls. All WebSocket connection and message callbacks received on background threads are automatically marshaled to Unity's main thread via `MainThreadDispatcher.Enqueue()`. The dispatcher is initialized automatically upon `Adk` creation.
+ListFilesResult recent = await storage.ListFiles();
+StorageFile details = await storage.GetFile(uploaded.FileId);
+await storage.DeleteFile(uploaded.FileId);
+```
+
+On desktop and in the editor, `UploadFile(path)` reads a local file and uploads it. On Android and iOS, pick a document with the platform's native picker (or a picker plugin), read its bytes, then call `Upload(bytes, options)`. The ADK doesn't bundle a file picker because its implementation and permissions differ by platform.
+
+The example project includes `Assets/StorageScreen.unity`, a ready-to-open storage screen. It provides editor file selection and exposes `SetSelectedFilePath(...)` and `SetSelectedFileBytes(...)` for a mobile picker callback.
+
+<!-- The rest of this section is inferred from the Swift ADK. Verify names and behaviour against the Unity API before publishing. -->
+
+Each upload returns a file reference with the file's ID, name, size, content type and a URL for reading it. `ListFiles` leaves out that URL, and `GetFile` includes it. To upload into a thread when you use `adk` directly, pass the thread ID in the options:
+
+```csharp
+var ref = await adk.Upload(pngBytes, new UploadOptions
+{
+    Filename = "chart.png",
+    ContentType = "image/png",
+    ThreadId = "THREAD_ID",
+    AllowedMimeTypes = new[] { "image/png" }
+});
+
+var page = await adk.ListFiles(new ListOptions { ThreadId = "THREAD_ID", Page = 1, Limit = 20 });
+var file = await adk.GetFile(ref.FileId, "THREAD_ID");   // includes a URL for reading the file
+await adk.DeleteFile(ref.FileId);
+```
+
+Follow an upload's progress with `UploadOptions.OnProgress`: it reports `0` when the upload starts and `1` once ART has stored the file. Set `TtlSeconds` to choose how long the file is kept, and `AllowedMimeTypes` to limit the types ART accepts.
+
+Every file has an owner, which depends on where you upload it from:
+
+| **Uploaded with** | **Owner** |
+|---|---|
+| `adk.Upload` | Your project, or the configuration you pass in `UploadOptions.ConfigId` |
+| `agent.Upload`, or `Upload` on an agent thread | The agent |
+| `orchestrator.Upload`, or `Upload` on an orchestrator thread | The orchestrator |
+| `Upload` on a channel | The channel's configuration (orchestrator-enabled channels only) |
+
+When a storage request fails, the ADK throws an `UploadException`. Its `Step` tells you which stage failed (`Validate`, `Upload`, `List`, `Get` or `Delete`), and `Status` holds the HTTP status code. A `403` means the user's role doesn't have storage permission.
+
+```csharp
+try
+{
+    await adk.Upload(pngBytes, new UploadOptions { ThreadId = "THREAD_ID" });
+}
+catch (UploadException e) when (e.Step == UploadStep.Upload && e.Status == 403)
+{
+    Debug.LogError("This user's role doesn't allow uploads");
+}
+```
+
+## Profiles and connectors
+
+<!-- Inferred from the Swift ADK. Verify names and behaviour against the Unity API before publishing. -->
+
+Update the signed-in user's profile. Only the fields you set are changed.
+
+```csharp
+await adk.UpdateProfile(new UpdateProfileData { FirstName = "Ada", Email = "ada@example.com" });
+```
+
+Each connector keeps its own profile for the user. Read it, or update the fields that the connector allows:
+
+```csharp
+var crm = adk.Connector("YOUR_CONNECTOR_ID");
+
+var profile = await crm.Profile();                                      // the allowed fields and their current values
+await crm.UpdateProfile(new Dictionary<string, object> { ["region"] = "eu" });   // only allowed fields can be changed
+```
+
+## Notifications
+
+<!-- Inferred from the Swift ADK. Verify names and behaviour against the Unity API before publishing. -->
+
+Notifications are an optional plugin. Add it to your `Adk` instance once and keep the object it returns:
+
+```csharp
+var inbox = adk.Use(Notifications.Create());
+
+// Receive new notifications as they arrive.
+Action stopListening = await inbox.OnNew(notification =>
+{
+    Debug.Log(notification.Title);
+});
+
+var unread = await inbox.List(new NotificationListParams { Status = NotificationStatus.Unread });
+await inbox.MarkRead();   // marks every unread notification as read
+```
+
+You can also send notifications and count unread notifications. A notification you send is delivered in-app unless you set `Channels` on `SendNotificationInput` to `InApp`, `Email` or both. To get the same object elsewhere in your app, call `adk.Plugin<NotificationsApi>("notifications")`.
+
+## Calling ART APIs
+
+<!-- Inferred from the Swift ADK. Verify names and behaviour against the Unity API before publishing. -->
+
+`Call` sends an authenticated request to an ART REST endpoint and returns the decoded JSON response:
+
+```csharp
+JObject result = await adk.Call("/v1/some-endpoint", new CallApiProps
+{
+    Method = "POST",
+    Payload = new JObject { ["key"] = "value" }
+});
+```
+
+To send a `multipart/form-data` request, pass a `FormDataPayload` as the payload:
+
+```csharp
+JObject response = await adk.Call("/v1/some-upload", new CallApiProps
+{
+    Method = "POST",
+    Payload = new FormDataPayload
+    {
+        Fields = new Dictionary<string, string> { ["purpose"] = "avatar" },
+        Files = new List<FormDataFile>
+        {
+            new FormDataFile { Field = "file", Data = pngBytes, Filename = "avatar.png", ContentType = "image/png" }
+        }
+    }
+});
+```
+
+## Errors
+
+<!-- Inferred from the Swift ADK. Verify exception names against the Unity API before publishing. -->
+
+| **Error** | **Thrown when** |
+|---|---|
+| `ConnectionException` | The connection failed or isn't available. See [When the connection fails](#when-the-connection-fails). |
+| `AuthHttpException` | ART rejected a sign-in request. `Status` holds the HTTP status, and `IsTerminal` is `true` for rejected credentials (401 or 403). |
+| `AgentRunException` | An agent run failed, or ended because the connection failed |
+| `RunLifecycleException` | `run.Done()` ended without an answer from the agent, because a newer run on the thread replaced it (`Superseded`) or its thread was disposed (`Closed`). `SendFeedback` also throws `Closed` when the agent isn't waiting for an answer. |
+| `UploadException` | A storage request failed |
+| `ConnectorException` | A connector ID is empty or can't be resolved, or you updated a field the connector doesn't allow |
+| `HttpCallException` | An ART REST request failed in `UpdateProfile` or a plugin |
+| `ArtJsonException` | Data you passed can't be converted to JSON |
+| `ArtException` | Other errors, for example an invalid argument such as an agent ID that isn't a slug, or a server error when ART refuses a request or `adk.Call` gets an error response |
+
+## Logging
+
+<!-- Inferred from the Swift ADK. Verify names against the Unity API before publishing. -->
+
+The ADK doesn't print anything by default. To see its warnings and errors, set a log handler:
+
+```csharp
+ArtLog.Handler = (level, message) =>
+{
+    Debug.Log($"[ART][{level}] {message}");
+};
+```
+
+## API reference
+
+| **Class / type** | **Purpose** |
+|---|---|
+| `Adk` | Top-level facade: connect, disconnect, subscribe, intercept, key management |
+| `AdkConfig` | Connection configuration (URI, credentials, auth token) |
+| `CredentialStore` | Holder for org, project and client credentials |
+| `BaseSubscription` | Base type for all channel subscriptions: `Push`, `FetchPresence`, `Unsubscribe` |
+| `Subscription` | Regular, secure, targeted and group channels: `Listen()`, `Bind()`, `Remove()`, `Emitter.On()` |
+| `SharedObjectChannel` | CRDT-backed shared-object channel: `State()`, `Query()`, `Flush()` |
+| `CRDTEngine` | The conflict-free replicated data engine behind shared objects |
+| `CRDTProxy` | Indexer-based path accessor for reading and changing shared-object state |
+| `PushOptions` | Push options for channels: `To`, `FromUsername`, `ThreadId` |
+| `PushConfig` | Push options for threads: `To`, `ThreadID`, `TimeoutMs` |
+| `KeyPairType` | Public/private key pair for encrypted channels |
+| `ConnectionDetail` | Delivered by `OnConnected`: connection ID, instance ID and tenant information |
+| `Agent` | Agent handle bound to `agent_com_<agentId>`: `Connect()`, `Thread()` |
+| `AgentThread` | Agent thread: `Run()`, `Listen()`, `OnHumanInput()` |
+| `Run` | An active agent run: `Done()`, `SendFeedback()` |
+| `AgentRunException` | Thrown by `Run.Done()` when the run fails; `Error.Code` holds the code |
+| `Orchestrator` | Orchestrator handle bound to `orch_com_<orchestratorId>`: `Connect()`, `Thread()` |
+| `OrchestratorThread` | Orchestrator thread: `Push()`, `Listen()`, `Bind()`, `Remove()`, `Dispose()`, `GetId()` |
+| `Storage` | File storage client: `Upload()`, `UploadFile()`, `ListFiles()`, `GetFile()`, `DeleteFile()` |
+
+## Platform and runtime notes
+
+### WebGL
+
+- **Desktop and mobile:** use the native WebSocket support in C# `System.Net.WebSockets`.
+- **WebGL:** `System.Net.WebSockets` isn't supported in WebGL builds. A JavaScript WebSocket bridge plugin is required to run in the browser.
+
+### Threads and the main thread
+
+Unity's engine APIs can only be called on the main thread. WebSocket and message callbacks that arrive on background threads are moved to the main thread for you with `MainThreadDispatcher.Enqueue()`, which starts automatically when you create an `Adk`.
 
 ### Testing
-Use the Unity Test Runner (**Window > General > Test Runner**) to run the included unit tests. To test live environments, configure your environment details in the `config.json` file.
 
----
+Use the Unity Test Runner (**Window › General › Test Runner**) to run the included unit tests. To test against a live environment, put your details in `config.json`.
+
+## Documentation
+
+For full guides, see the [ART ADK documentation](https://docs.arealtimetech.com/docs/adk/). For what's new in each release and how to upgrade, see the changelog in the package repository.
 
 ## License
 
